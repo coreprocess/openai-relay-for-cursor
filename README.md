@@ -42,6 +42,14 @@ Edit `.env`:
 | `NGROK_AUTHTOKEN` | from [dashboard.ngrok.com → Your Authtoken](https://dashboard.ngrok.com/get-started/your-authtoken) |
 | `NGROK_DOMAIN`    | your free dev domain from [dashboard.ngrok.com → Domains](https://dashboard.ngrok.com/domains), e.g. `xyz.ngrok-free.app` |
 
+> **About the tunnel.** Cursor streams responses as Server-Sent Events, and the tunnel has to pass them
+> through *unbuffered*. If it buffers, the protocol part works fine (status 200 in the relay log) but
+> Cursor shows nothing until the whole answer is done, or times out. ngrok does this correctly, which
+> is why it is embedded. Cloudflare *Quick* Tunnels buffer SSE and will not work; named Cloudflare
+> tunnels and Tailscale Funnel do (see [use case 4](#use-case-4-bring-your-own-tunnel-or-run-locally-only)).
+> The ngrok free plan includes 1 GB of egress per month; agent sessions with large contexts add up, so
+> keep an eye on the usage page in the ngrok dashboard.
+
 ### 2. Start
 
 ```bash
@@ -108,8 +116,10 @@ are done debugging and delete `logs/`.
 ## Use case 4: Bring your own tunnel or run locally only
 
 Leave `NGROK_AUTHTOKEN` empty and the relay only listens on `HOST:PORT`. Put any HTTPS tunnel or reverse
-proxy in front of it that supports streaming (Server-Sent Events). Note that Cloudflare *Quick* Tunnels
-buffer SSE; named Cloudflare tunnels, Tailscale Funnel and ngrok work.
+proxy in front of it that passes Server-Sent Events through unbuffered (see the tunnel note in use
+case 1): named Cloudflare tunnels, Tailscale Funnel and the ngrok CLI work, Cloudflare *Quick* Tunnels
+do not. To verify a tunnel, run the `curl -sN` test from [Troubleshooting](#troubleshooting) against its
+public URL – the chunks must arrive one by one, not all at once at the end.
 
 ## How it works
 
@@ -160,6 +170,7 @@ buffer SSE; named Cloudflare tunnels, Tailscale Funnel and ngrok work.
 | `upstream status=400 ... reasoning_effort ... /v1/chat/completions` | Request bypassed the translation; check the path Cursor calls in the log   |
 | `upstream status=404 model_not_found`                              | The resolved model (`model=alias->real` in the log) is not enabled for your key/project |
 | Cursor renders nothing despite `status=200`                        | Compare `4-client-response.sse` with `3-upstream-response.sse`               |
+| Answer appears only at the very end, or Cursor times out           | Your tunnel buffers SSE (e.g. Cloudflare Quick Tunnel). Use ngrok or a named tunnel, see the tunnel note in use case 1 |
 | `dropped=[...]` in the request line                                | Cursor sent a field the translation does not map yet – please open an issue  |
 | `tunnel failed: ...`                                               | Domain already in use by another agent (e.g. the `ngrok` CLI) or wrong token |
 
@@ -197,7 +208,8 @@ Relay experiments tend to live longer than intended. Treat this one accordingly:
 - Reasoning summaries and `reasoning.encrypted_content` cannot be returned through Chat Completions
   chunks, so the model does not see its previous reasoning in later turns (answers and tool results
   are preserved).
-- ngrok free plan: 1 GB egress per month; the browser interstitial does not affect API traffic.
+- The tunnel must not buffer SSE (see the tunnel note in use case 1). ngrok's browser interstitial does
+  not affect API traffic.
 
 ## Development
 
