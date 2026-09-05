@@ -32,10 +32,12 @@ const handleRequest = async (config: RelayConfig, req: IncomingMessage, res: Ser
     const modelInfo = alias ? `${alias.aliasedFrom}->${alias.model}` : String(json?.model ?? '-');
     const effortInfo = String((plan.body?.reasoning as { effort?: string } | undefined)?.effort ?? '-');
     const pathInfo = plan.path === path ? path : `${path} -> ${plan.path} (${plan.note})`;
+    const clientIp = req.headers['x-forwarded-for'] ?? req.socket.remoteAddress ?? '-';
     logLine(
         `${requestId} ${method} ${pathInfo} model=${modelInfo} effort=${effortInfo} stream=${String(json?.stream ?? false)} ` +
-            `keys=[${json ? Object.keys(json).join(',') : '-'}] ua=${req.headers['user-agent'] ?? '-'}`,
+            `keys=[${json ? Object.keys(json).join(',') : '-'}] from=${String(clientIp)} ua=${req.headers['user-agent'] ?? '-'}`,
     );
+    await log.write('0-client-headers.json', JSON.stringify({ ...req.headers, authorization: '<redacted>' }, null, 2));
     await log.write('1-client-request.json', rawBody.toString('utf8'));
     if (plan.body) {
         await log.write('2-upstream-request.json', JSON.stringify(plan.body, null, 2));
