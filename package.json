@@ -1,0 +1,25 @@
+{
+    "name": "openai-relay-for-cursor",
+    "version": "0.2.0",
+    "private": true,
+    "type": "module",
+    "description": "Run GPT-6 Astra (and other Responses-API-only OpenAI models) in Cursor's Agent with your own API key: a local relay with an embedded ngrok tunnel that translates Cursor's BYOK requests to the OpenAI Responses API.",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/coreprocess/openai-relay-for-cursor.git"
+    },
+    "engines": {
+        "node": ">=24"
+    },
+    "scripts": {
+        "start": "node --env-file=.env src/server.ts",
+        "typecheck": "tsc --noEmit"
+    },
+    "dependencies": {
+        "@ngrok/ngrok": "^1.7.0"
+    },
+    "devDependencies": {
+        "@types/node": "^24.0.0",
+        "typescript": "^5.9.0"
+    }
+}
