@@ -87,6 +87,12 @@ createServer((req, res) => {
         `relay listening on http://${config.host}:${config.port} -> ${config.upstreamOrigin} ` +
             `(modelPrefix="${config.modelPrefix}" defaultEffort=${config.defaultReasoningEffort ?? '-'} logBodies=${config.logBodies})`,
     );
+    if (config.logBodies) {
+        logLine(
+            `WARNING: LOG_BODIES=1 - full prompts, repository contents and model answers are written to ./${config.logDir}. ` +
+                'Set LOG_BODIES=0 and delete the directory when you are done debugging.',
+        );
+    }
     const publicUrl = await startTunnel(config).catch((error: unknown) => {
         logLine(`tunnel failed: ${describeError(error)}`);
         process.exit(1);

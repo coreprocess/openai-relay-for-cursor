@@ -96,9 +96,11 @@ Set `LOG_BODIES=1` and every request produces four files in `logs/` sharing one 
 | `3-upstream-response.sse`  | raw Responses API event stream from OpenAI                |
 | `4-client-response.sse`    | Chat Completions chunks returned to Cursor                |
 
-The console prints one line per request with path, translation, model alias resolution, effort,
-top-level body keys and user agent, followed by upstream status, OpenAI `x-request-id`, time to first
-byte and total duration. Fields the translation does not know show up as `dropped=[...]`.
+Request *shape* and *content* are logged separately on purpose. The console always prints one line
+per request with path, translation, model alias resolution, effort, top-level body keys, origin IP,
+user agent, upstream status, OpenAI `x-request-id`, time to first byte and total duration – but never
+prompt content. Fields the translation does not know show up as `dropped=[...]`. Only `LOG_BODIES=1`
+writes content, and the relay prints a warning at startup while it is on.
 
 The log files contain your prompts, repository contents and answers. Turn `LOG_BODIES` off when you
 are done debugging and delete `logs/`.
@@ -170,6 +172,24 @@ curl -sN https://<your-domain>.ngrok-free.app/v1/chat/completions \
 ```
 
 Expected: `chat.completion.chunk` frames containing `"content":"OK"` and a final `data: [DONE]`.
+
+## Security notes
+
+Relay experiments tend to live longer than intended. Treat this one accordingly:
+
+- **Use a dedicated OpenAI project and key** for the relay, with a monthly budget set in the OpenAI
+  dashboard. Revoking or rotating it then never affects anything else.
+- **The relay token is a credential.** Anyone who has it and your tunnel URL can spend on your key.
+  Generate it with `openssl rand -hex 32`, don't reuse it, and rotate it (one line in `.env`, one field
+  in Cursor) whenever you're unsure who has seen it.
+- **Rotate the OpenAI key after testing phases**, especially if it was ever pasted into a chat, a
+  ticket or a screenshot while you were debugging.
+- **`LOG_BODIES=0` in normal operation.** With `1`, every request writes your full prompt and repository
+  excerpts to disk. Delete `logs/` afterwards.
+- **Stop the relay when you don't need it.** With `NGROK_DOMAIN` set, the endpoint is reachable from the
+  internet whenever the process runs; without the process, the URL is dead.
+- Requests to the relay originate from Cursor's backend (AWS), not from your machine, so an IP
+  allow-list is not practical – the relay token is the access control.
 
 ## Limitations
 
