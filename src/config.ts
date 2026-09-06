@@ -3,6 +3,10 @@ import type { CacheConfig } from './reasoning/types.ts';
 import type { TransportLimits } from './transport.ts';
 
 export type RelayConfig = {
+    /** Opt-in private Unix-domain socket; never bound to the public HTTP listener. */
+    adminSocket?: string;
+    /** Optional private export directory; defaults outside the serving checkout. */
+    adminSnapshotDir?: string;
     transport?: Partial<TransportLimits>;
     cache: CacheConfig;
     host: string;
@@ -39,6 +43,8 @@ const requireEnv = (name: string): string => {
 };
 
 export const loadConfig = (): RelayConfig => ({
+    adminSocket: process.env.RELAY_ADMIN_SOCKET || undefined,
+    adminSnapshotDir: process.env.RELAY_ADMIN_SNAPSHOT_DIR || undefined,
     cache: loadCacheConfig(),
     transport: Object.fromEntries([
         ['maxRequestBytes', optionalTransportLimit('RELAY_MAX_REQUEST_BYTES')],

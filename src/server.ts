@@ -19,7 +19,15 @@ const shutdown = async (): Promise<void> => {
 };
 process.once('SIGINT', () => { void shutdown(); });
 process.once('SIGTERM', () => { void shutdown(); });
-relay.server.listen(config.port, config.host, async () => {
+try {
+    await relay.startAdmin();
+    if (config.adminSocket) logLine('private local admin socket enabled');
+} catch {
+    logLine('private admin startup failed; relay did not start');
+    await shutdown();
+    process.exitCode = 1;
+}
+if (!stopping) relay.server.listen(config.port, config.host, async () => {
     logLine(`relay listening on http://${config.host}:${config.port} -> ${config.upstreamOrigin} reasoningCache=${config.cache.enabled}`);
     if (config.logBodies) logLine('WARNING: LOG_BODIES=1 writes sensitive prompts, output and replay payloads to disk.');
     try {

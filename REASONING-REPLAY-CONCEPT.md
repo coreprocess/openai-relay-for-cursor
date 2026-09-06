@@ -1,6 +1,6 @@
 # Encrypted reasoning replay
 
-Revision 11 — current implementation on `main`, 2026-09-06.
+Revision 12 — implementation including optional private local administration, 2026-09-06.
 
 ## Purpose
 
@@ -230,7 +230,40 @@ Three fixed JPEGs from [Lorem Picsum](https://picsum.photos/) were correctly des
 
 The tests do not prove every model/provider behavior, month-old ciphertext compatibility, physical power-loss recovery, sustained production load, or an actual Cursor/tunnel deployment. Identical visible histories and unobserved or scope-changed generations can remain indistinguishable. Local `finish` proves local delivery, not receipt beyond the relay socket.
 
-## 11. Code locations
+## 11. Live local inspection
+
+An optional `RELAY_ADMIN_SOCKET` enables a separate Unix-domain listener. It is not part of the
+public HTTP server and cannot be reached through the configured ngrok tunnel. Access is limited
+by a private directory and owner-only socket permissions; there is no arbitrary SQL or
+caller-selected snapshot destination.
+
+`pnpm cache:admin status` requests runtime and database metadata through the owner's existing
+connection. Runtime counters start at process startup and distinguish dispatched replay from
+provider HTTP success. Database aggregates scan a bounded number of rows, report exact or
+lower-bound values, and are cached for five seconds. Inspection does not touch payloads, renew
+intents, reset retention clocks, checkpoint the WAL, or run cleanup. Retention information is
+reported from its last validated sample rather than advancing clock state for an admin poll.
+
+`pnpm cache:admin snapshot` uses Node's SQLite online backup API through that same source
+connection. Only one copy runs at a time. It copies in page batches into a private generated
+inspection path after capacity checks; publication occurs only on successful completion.
+Inspection exports omit the cache secret and are not activation/recovery backups. They default
+to a private `~/.openai-relay-inspection` directory (overridable with `RELAY_ADMIN_SNAPSHOT_DIR`),
+use owner-read-only completed files, and preserve earlier snapshots until manually removed.
+Copies run in 32-page batches with a 64 MiB free-space margin and a 256 MiB source-size ceiling.
+They contain sensitive payloads and must remain private. Shutdown waits for any pending backup before closing
+SQLite; a disconnected admin client does not grant permission to close a still-used handle.
+
+The socket is opt-in at startup, so installing this code does not alter an already-running relay.
+The existing offline `backup` and `restore` commands retain their separate recovery semantics.
+
+An isolated five-call real-OpenAI check verified metadata reads without source-row/touch changes,
+a consistent snapshot during two ongoing generations, and continued exact-block replay afterward.
+Snapshots were checked separately for integrity, privacy and secret omission; the earlier export
+survived the next copy. The test ended with no active sessions/intents. It did not deploy this
+interface to the serving relay or establish large-store snapshot latency.
+
+## 12. Code locations
 
 - Request orchestration and validation: `src/app.ts`, `requestHandler.ts`, `requestValidation.ts`, `http.ts`.
 - Alias and visible translation: `modelAlias.ts`, `rewrite.ts`, `chatToResponses.ts`, `chatMessages.ts`.
@@ -240,4 +273,5 @@ The tests do not prove every model/provider behavior, month-old ciphertext compa
 - Capture/session lifecycle: `src/reasoning/capture.ts`, `session.ts`, `lifecycle.ts`.
 - Transport/output: `transport.ts`, `clientWrite.ts`, `progressBody.ts`, `sse.ts`, `relayResponse.ts`, converters and `responsesTypes.ts`.
 - Diagnostics and process lifecycle: `log.ts`, `server.ts`, `tunnel.ts`.
+- Private local administration: `src/admin/`, `src/reasoning/inspection*.ts`, `metrics.ts`, and `admin.ts`.
 - Automatic regression tests: `tests/*.test.ts`. Live harnesses are manual opt-ins and do not run under `pnpm test`.

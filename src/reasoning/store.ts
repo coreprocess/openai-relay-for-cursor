@@ -2,6 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, chmodSync, constants, closeSync, openSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { ReplayInspectionHelper } from './inspection.ts';
+import type { InspectionOptions, InspectionSnapshot, ReplayInspection } from './inspection.ts';
+import { INSPECTION_TTL_MS } from './inspection-metrics.ts';
 import { CLEANUP_BATCH_SIZE, DAY_MS, RetentionClock } from './retention.ts';
 import { existingReplayStore, loadSecret, StoreFiles } from './store-files.ts';
 import { publishObservation } from './store-observe.ts';
@@ -17,11 +20,12 @@ export class ReplayStore {
     private readonly files: StoreFiles;
     private readonly clock: RetentionClock;
     private readonly reader: RecordReader;
+    private readonly inspection: ReplayInspectionHelper;
     private closed = false;
     private failed = false;
     private coverageGap = false;
 
-    constructor(options: StoreOptions) {
+    constructor(options: StoreOptions, inspectionOptions: InspectionOptions = {}) {
         for (const name of ['diskBytes', 'reserveBytes', 'memoryBytes', 'maxEntryBytes'] as const) {
             if (!Number.isSafeInteger(options[name]) || options[name] < 0) throw new Error(`Invalid replay ${name}`);
         }
@@ -42,6 +46,7 @@ export class ReplayStore {
         this.files = new StoreFiles(this.options.path, options.reserveBytes);
         this.db = new DatabaseSync(this.options.path);
         this.reader = new RecordReader(this.db, this.options);
+        this.inspection = new ReplayInspectionHelper(this.db, this.options.path, inspectionOptions);
         try {
             this.db.exec(`PRAGMA busy_timeout = 0; PRAGMA locking_mode = EXCLUSIVE;
                 PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;
@@ -297,8 +302,30 @@ export class ReplayStore {
         this.coverageGap = true;
     }
 
+    /** Metadata only: no replay validation, clock sampling, touches, expiry, or cleanup. */
+    inspect(): ReplayInspection {
+        const enabled = !this.closed && !this.failed && !this.coverageGap;
+        return Object.freeze({ state: this.closed ? 'closed' : this.failed ? 'failed' : this.coverageGap ? 'disabled' : 'ready',
+            enabled, closed: this.closed, failed: this.failed, coverageGap: this.coverageGap,
+            retention: this.clock.status(), cacheTtlMs: INSPECTION_TTL_MS, snapshotPending: this.inspection.isPending,
+            ...this.inspection.inspect(!this.closed && !this.failed && !this.db.isTransaction) });
+    }
+
+    async createInspectionSnapshot(): Promise<InspectionSnapshot> {
+        this.assertOpen();
+        if (this.db.isTransaction) throw new Error('Inspection snapshot refuses an active database transaction');
+        return this.inspection.createSnapshot(() => {
+            this.assertOpen();
+            if (this.db.isTransaction) throw new Error('Inspection snapshot refuses an active database transaction');
+        });
+    }
+
+    /** Shutdown waits even if the snapshot request failed; that request receives its own error. */
+    waitForInspection(): Promise<void> { return this.inspection.wait(); }
+
     close(): void {
         if (this.closed) return;
+        if (this.inspection.isPending) throw new Error('Replay inspection pending; await waitForInspection() before close()');
         this.closed = true;
         this.reader.clear();
         try { this.db.close(); } finally { this.files.close(); }

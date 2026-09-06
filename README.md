@@ -404,6 +404,92 @@ This validates broad photo classification for these fixtures, not general OCR, s
 or the cause of the earlier tiny flat-color PNG anomaly. Harnesses `tests/live-picsum.ts` and
 `tests/live-image-choice.ts` are manual, billable opt-ins and never run under `pnpm test`.
 
+## Inspecting a running relay safely
+
+Enable the **private Unix-domain admin socket** in the relay's environment:
+
+```bash
+RELAY_ADMIN_SOCKET=data/admin/relay-admin.sock
+```
+
+This takes effect on the next planned startup. Do not restart the relay serving an agent session
+from that dependent session. The existing OpenAI/ngrok listener does not expose admin routes.
+Unix filesystem permissions authenticate local access: the socket directory is private and the
+socket is `0600`. Processes running as the same account are trusted. An existing socket/path is
+not overwritten or unlinked automatically; resolve stale sockets only after confirming no owner
+is using them.
+
+From the repository directory, using the same OS account:
+
+```bash
+pnpm cache:admin status
+pnpm cache:admin status --json
+pnpm cache:admin snapshot
+# Custom paths can be supplied without loading the relay's credentials:
+pnpm cache:admin status --socket /absolute/private/path/relay.sock --json
+```
+
+The CLI defaults to `data/admin/relay-admin.sock`, or the `RELAY_ADMIN_SOCKET` environment variable.
+It does not load `.env` or require an OpenAI key. Use `--socket` if the server's custom `.env` path
+is not exported in your terminal.
+
+Status uses the owner's existing SQLite connection and runtime counters. It does not touch
+payload timestamps, renew intents, expire records, checkpoint the WAL, or load prompts/ciphertext.
+Database aggregate counts are bounded and briefly cached; results label limited counts rather
+than claiming a complete scan. Runtime counters are process-local and dispatched replay is not
+a provider-acceptance measurement.
+
+`snapshot` asks the owner to use SQLite's online backup API, copying in small page batches while
+normal requests can continue. Only one snapshot runs at a time, disk capacity is checked, and the
+source connection stays open until copying settles. The completed file path is returned only
+after successful publication. Inspect that **copy**, never bypass locks on the live database:
+
+```bash
+sqlite3 -readonly 'file:/path/returned/by/snapshot.sqlite?immutable=1' 'SELECT count(*) FROM payloads;'
+```
+
+Use `immutable=1` only on the completed, stable export—not on the changing live database or a
+hand-copied live WAL. It prevents the inspection connection from creating WAL/SHM sidecars.
+
+Inspection copies default to `~/.openai-relay-inspection/<generated-id>/snapshot.sqlite`; set
+`RELAY_ADMIN_SNAPSHOT_DIR` to another private directory if needed. They are created outside the
+checkout by default so group-writable development directories need not have their permissions
+changed. Export ancestors must be real, trusted, non-writable-by-others directories (a root-owned
+sticky `/tmp` ancestor is permitted); the export root and generated child are `0700`. Unsafe paths
+are rejected, never repaired automatically. A configured path is server-side policy, not an API argument.
+
+Completed copies are owner-read-only (`0400`) and omit the cache secret. They contain sensitive
+assistant/tool output and encrypted reasoning, and are **not** activation/recovery backups. They
+are not automatically activated, deleted, or restored. Existing snapshots remain intact when
+another is created, including after restart; remove copies you no longer need manually.
+Use the separate offline backup/restore workflow for recovery.
+
+A copy uses 32-page batches, requires at least 64 MiB of remaining filesystem capacity beyond
+estimated copying needs, and currently declines sources above 256 MiB including database/WAL/SHM
+storage. Capacity is checked during copying too. A failed copy cleans up only its own private
+partial directory and does not poison the live cache. Status remains useful when a snapshot is
+declined. The defaults are safety limits, not performance claims.
+
+Snapshot I/O has a cost; it is not a promise of zero latency impact or a substitute for load
+testing. The admin socket accepts fixed status/snapshot operations only, not arbitrary SQL or
+caller-supplied destination paths. No LLM calls are made by administration.
+
+### Pre-merge live administration check
+
+`tests/live-admin.ts` is an explicitly authorized five-call live harness, excluded from `pnpm test`.
+It uses its own loopback listener, private admin socket, cache, export directory, synthetic invoice
+history and logs; it never starts ngrok or changes the serving checkout. It loads only the key from
+`REPLAY_SMOKE_KEY_FILE` when `ALLOW_BILLABLE_REPLAY_SMOKE=1` is explicitly set.
+
+The 2026-09-06 run passed all six acceptance checks: status/CLI refresh without source-state changes,
+a snapshot completed while two real generations remained active, correct concurrent replies,
+continued exact encrypted-block replay, a second snapshot preserving the first, and no unauthenticated
+admin data from the public listener. Both copies passed integrity/foreign-key checks, were `0400`,
+and had no secret. Final live status had zero sessions/intents and no request or preparation failures.
+All test-owned listeners were stopped. Snapshot duration was 58 ms for this small test database;
+this does not establish performance for large production stores. Deployment still requires a separate
+planned restart and a check of the actual admin socket afterward.
+
 ## Development
 
 ```bash

@@ -5,6 +5,15 @@ export const MIN_IDLE_MS = 30 * DAY_MS;
 export const CLEANUP_BATCH_SIZE = 100;
 const MAX_CLOCK_DRIFT_MS = 60_000;
 
+export type RetentionStatus = Readonly<{
+    idleMs: number;
+    minimumBarrierMs: number;
+    barrierActive: boolean;
+    barrierRemainingMs: number;
+    lastSampledAt: number;
+    basis: 'last-validated-sample';
+}>;
+
 /** A restart or discontinuous clock starts a fresh, monotonic deletion embargo. */
 export class RetentionClock {
     readonly idleMs: number;
@@ -41,6 +50,14 @@ export class RetentionClock {
         this.lastWall = wall;
         this.lastMonotonic = monotonic;
         return { wall, monotonic };
+    }
+
+    /** Passive status: never reads clocks or resets the retention barrier. */
+    status(): RetentionStatus {
+        const barrierRemainingMs = Math.max(0, MIN_IDLE_MS - (this.lastMonotonic - this.barrierStart));
+        return Object.freeze({ idleMs: this.idleMs, minimumBarrierMs: MIN_IDLE_MS,
+            barrierActive: barrierRemainingMs > 0, barrierRemainingMs,
+            lastSampledAt: this.lastWall, basis: 'last-validated-sample' as const });
     }
 
     now(): number {

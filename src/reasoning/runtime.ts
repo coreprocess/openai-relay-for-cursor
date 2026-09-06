@@ -1,4 +1,6 @@
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import type { IncomingHttpHeaders } from 'node:http';
 import type { RelayConfig } from '../config.ts';
 import type { JsonBody } from '../http.ts';
@@ -10,9 +12,11 @@ import { ReplaySession } from './session.ts';
 import { ReplayStore } from './store.ts';
 import type { IdentityContext } from './types.ts';
 import { CacheAdmission, CacheUnavailableError } from './admission.ts';
+import { ReplayMetrics } from './metrics.ts';
 
 export class ReplayRuntime {
     readonly store: ReplayStore | null;
+    readonly metrics = new ReplayMetrics();
     private readonly sessions = new Set<ReplaySession>();
     private readonly maintenance: ReturnType<typeof setInterval> | null;
     private closed = false;
@@ -29,7 +33,7 @@ export class ReplayRuntime {
             // Store validation charges a conservative 32x JSON expansion. Its transient copy
             // must fit inside the reserved replay budget, not multiply that budget by 32.
             maxReplayBytes: Math.max(1, Math.floor(this.admission.replayScratchBytes / 32)), maxPlanRecords: c.maxPlanRecords,
-        }) : null;
+        }, { directory: resolve(config.adminSnapshotDir ?? join(homedir(), '.openai-relay-inspection')) }) : null;
         if (!c.enabled && this.store) {
             // Hold exclusive ownership while disabled traffic is unobserved. Otherwise an
             // enabled second instance could consume the gap while this one is still serving.
@@ -65,7 +69,9 @@ export class ReplayRuntime {
             try {
                 this.store.fence(scope.credential, scope.model,
                     typeof original.user === 'string' || typeof original.safety_identifier === 'string' ? scope.caller : undefined);
+                this.metrics.scopeFences++;
             } catch (error) {
+                this.metrics.preparationFailures++;
                 logLine('reasoning cache safety failure operation=fence');
                 throw new CacheUnavailableError(error);
             }
@@ -75,6 +81,7 @@ export class ReplayRuntime {
         try { identity = prepareIdentity(original, outbound, context); }
         catch (error) {
             if (error instanceof CanonicalLimitError) {
+                this.metrics.identityLimitSkips++;
                 logLine(`reasoning cache skip reason=identity-limit limit=${error.limit}`);
                 return { payload: null, session: null };
             }
@@ -85,9 +92,12 @@ export class ReplayRuntime {
         if (!release) {
             try { this.store.bypass(identity.scope, start); }
             catch (error) {
+                this.metrics.preparationFailures++;
                 logLine('reasoning cache safety failure operation=bypass');
                 throw new CacheUnavailableError(error);
             }
+            if (this.admission.refusalReason(identity.canonicalBytes) === 'maxConcurrent') this.metrics.concurrencyBypasses++;
+            else this.metrics.memoryBypasses++;
             logLine(`reasoning cache bypass reason=${this.admission.refusalReason(identity.canonicalBytes)} active=${this.admission.activeSessions} leasedBytes=${this.admission.retainedBytes}; forwarding without replay`);
             return { payload: null, session: null };
         }
@@ -109,9 +119,13 @@ export class ReplayRuntime {
                 release();
             });
             this.sessions.add(session);
+            if (identity.eligible) this.metrics.cachedDispatches++; else this.metrics.observeOnlyDispatches++;
+            if (plan.length) this.metrics.replayingDispatches++;
+            this.metrics.replayedBlocksDispatched += plan.length;
             logLine(`reasoning cache dispatch replacements=${plan.length} eligible=${identity.eligible} active=${this.admission.activeSessions} leasedBytes=${this.admission.retainedBytes}`);
             return { payload, session };
         } catch (error) {
+            this.metrics.preparationFailures++;
             release();
             try { if (id) this.store.poison(id); }
             catch (poisonError) { throw new CacheUnavailableError(poisonError); }
@@ -119,6 +133,24 @@ export class ReplayRuntime {
             throw new CacheUnavailableError(error);
         }
     }
+
+    inspect() {
+        const memory = process.memoryUsage();
+        return {
+            sampledAt: new Date().toISOString(), pid: process.pid, cacheEnabled: this.config.cache.enabled,
+            stopping: this.closed, activeCachedSessions: this.admission.activeSessions,
+            leasedCacheBytes: this.admission.retainedBytes, cacheBudgetBytes: this.config.cache.memoryBytes,
+            processMemory: { rssBytes: memory.rss, heapUsedBytes: memory.heapUsed },
+            counters: this.metrics.snapshot(), store: this.store?.inspect() ?? null,
+        };
+    }
+
+    createInspectionSnapshot() {
+        if (this.closed || !this.store) throw new Error('Cache store unavailable for inspection');
+        return this.store.createInspectionSnapshot();
+    }
+
+    async waitForInspection(): Promise<void> { await this.store?.waitForInspection(); }
 
     stop(): void {
         if (this.maintenance) clearInterval(this.maintenance);

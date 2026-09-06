@@ -7,13 +7,16 @@ import { CacheUnavailableError } from './reasoning/admission.ts';
 import { handleRequest } from './requestHandler.ts';
 import { InvalidRequestError } from './requestValidation.ts';
 import { transportLimits } from './transport.ts';
+import { startAdminServer } from './admin/server.ts';
+import { resolveAdminSocketPath } from './admin/paths.ts';
 
-/** Importable construction for offline tests; never loads .env or starts a tunnel. */
+/** Importable factory. Neither public listener nor private admin socket starts until requested. */
 export const createRelay = (config: RelayConfig) => {
-    transportLimits(config); // Fail invalid configuration before opening cache files or listening.
+    transportLimits(config);
     const runtime = new ReplayRuntime(config);
     const server = createServer((req, res) => {
         handleRequest(config, runtime, req, res).catch((error: unknown) => {
+            runtime.metrics.requestFailures++;
             logLine('relay request failed');
             if (res.headersSent) { if (!res.writableFinished) res.destroy(); return; }
             if (error instanceof RequestBodyLimitError) {
@@ -32,11 +35,33 @@ export const createRelay = (config: RelayConfig) => {
             sendJson(res, 502, { error: { message: 'Relay failed to reach upstream', type: 'relay_error' } });
         });
     });
-    const close = async (): Promise<void> => {
-        const stopped = new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-        runtime.stop();
-        server.closeAllConnections();
-        try { await stopped; } finally { runtime.close(); }
+    let admin: Promise<Awaited<ReturnType<typeof startAdminServer>> | null> | undefined;
+    let closing: Promise<void> | undefined;
+    const startAdmin = () => {
+        if (closing) return Promise.reject(new Error('Relay is stopping'));
+        admin ??= config.adminSocket ? startAdminServer(resolveAdminSocketPath(config.adminSocket), {
+            status: () => runtime.inspect(), snapshot: () => runtime.createInspectionSnapshot(),
+        }) : Promise.resolve(null);
+        return admin;
     };
-    return { server, runtime, close };
+    const close = (): Promise<void> => {
+        if (closing) return closing;
+        closing = (async () => {
+            const stopped = server.listening ? new Promise<void>((resolve, reject) =>
+                server.close((error) => error ? reject(error) : resolve())) : Promise.resolve();
+            runtime.stop();
+            server.closeAllConnections();
+            try {
+                const localAdmin = await admin?.catch(() => null);
+                await localAdmin?.close();
+                await stopped;
+            } finally {
+                // Online backup owns the SQLite handle until its promise settles.
+                await runtime.waitForInspection();
+                runtime.close();
+            }
+        })();
+        return closing;
+    };
+    return { server, runtime, startAdmin, close };
 };

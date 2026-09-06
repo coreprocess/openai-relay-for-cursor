@@ -43,6 +43,8 @@ export const handleRequest = async (config: RelayConfig, runtime: ReplayRuntime,
         // Intent transaction and transport invocation stay in one synchronous turn.
         const pending = forwardToUpstream(config, method, plan.path, req.headers, payload, combinedSignal);
         const upstream = await pending;
+        runtime.metrics.upstreamResponses++;
+        if (!upstream.ok) runtime.metrics.upstreamHttpErrors++;
         transport.progress(); session?.progress();
         if (payload && log.enabled) await log.write('2-upstream-request.json', payload.toString('utf8'));
         logLine(`${requestId} upstream status=${upstream.status} convert=${plan.convertToChatCompletions}`);
