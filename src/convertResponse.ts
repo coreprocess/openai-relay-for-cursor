@@ -3,9 +3,9 @@ import { type ResponsesObject, toChatUsage } from './responsesTypes.ts';
 /** Non-streaming: Responses API object -> Chat Completions `chat.completion` object. */
 export const toChatCompletion = (response: ResponsesObject) => {
     const output = response.output ?? [];
-    const content = output
-        .filter((item) => item.type === 'message')
-        .flatMap((item) => item.content ?? [])
+    const parts = output.filter((item) => item.type === 'message').flatMap((item) => item.content ?? []);
+    const refusals = parts.filter((part) => part.type === 'refusal' && typeof part.refusal === 'string');
+    const content = parts
         .filter((part) => part.type === 'output_text')
         .map((part) => part.text ?? '')
         .join('');
@@ -29,9 +29,11 @@ export const toChatCompletion = (response: ResponsesObject) => {
                 message: {
                     role: 'assistant',
                     content: content.length > 0 ? content : null,
+                    ...(refusals.length > 0 ? { refusal: refusals.map((part) => part.refusal).join('') } : {}),
                     ...(hasToolCalls ? { tool_calls: toolCalls } : {}),
                 },
-                finish_reason: hasToolCalls ? 'tool_calls' : 'stop',
+                finish_reason: response.status === 'incomplete' && response.incomplete_details?.reason === 'max_output_tokens'
+                    ? 'length' : hasToolCalls ? 'tool_calls' : 'stop',
             },
         ],
         usage: toChatUsage(response.usage),

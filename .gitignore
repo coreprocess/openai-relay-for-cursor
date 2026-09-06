@@ -1,3 +1,14 @@
 node_modules/
 logs/
 .env
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.secret
+coverage/
+private-backup/
+recovered/
+*.sqlite.reserve
+*.sqlite.blocked
+*.sqlite.guard

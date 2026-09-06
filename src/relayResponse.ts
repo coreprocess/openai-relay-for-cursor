@@ -1,72 +1,111 @@
 import type { ServerResponse } from 'node:http';
+import { writeClientFrame } from './clientWrite.ts';
 import { toChatCompletion } from './convertResponse.ts';
 import { createResponsesToChatStreamConverter } from './convertStream.ts';
 import { sendJson } from './http.ts';
-import { logLine, type RequestLog, truncate } from './log.ts';
+import { createLogBuffer, logLine, type RequestLog } from './log.ts';
+import type { RequestTransport } from './transport.ts';
+import { bodyChunks, readResponseText } from './progressBody.ts';
+import type { ReplaySession } from './reasoning/session.ts';
 import type { ResponsesObject, ResponsesStreamEvent } from './responsesTypes.ts';
 import { readSseEvents } from './sse.ts';
 
 const parseEventData = (data: string): ResponsesStreamEvent | null => {
-    try {
-        return JSON.parse(data) as ResponsesStreamEvent;
-    } catch {
-        return null;
-    }
+    try { return JSON.parse(data) as ResponsesStreamEvent; } catch { return null; }
 };
-
 const sseHeaders = { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' };
 
-/** Streams a Responses SSE body to the client as Chat Completions chunks, logging both sides. */
-export const streamConverted = async (upstream: Response, res: ServerResponse, log: RequestLog): Promise<void> => {
+export const streamConverted = async (
+    upstream: Response, res: ServerResponse, log: RequestLog, session?: ReplaySession | null, transport?: RequestTransport,
+): Promise<void> => {
     res.writeHead(200, sseHeaders);
     res.flushHeaders();
-    const upstreamFrames: string[] = [];
-    const clientFrames: string[] = [];
+    const upstreamFrames = createLogBuffer(log.enabled);
+    const clientFrames = createLogBuffer(log.enabled);
     const convert = createResponsesToChatStreamConverter();
-    for await (const event of readSseEvents(upstream.body ?? new ReadableStream())) {
-        upstreamFrames.push(`event: ${event.event ?? '-'}\ndata: ${event.data}\n\n`);
-        const parsed = parseEventData(event.data);
-        for (const frame of parsed ? convert(parsed) : []) {
-            clientFrames.push(frame);
-            res.write(frame);
+    let terminal = false;
+    try {
+        for await (const event of readSseEvents(bodyChunks(upstream.body, () => {
+            transport?.progress(); session?.progress();
+        }), transport?.limits.maxSseEventBytes)) {
+            if (log.enabled) upstreamFrames.push(`event: ${event.event ?? '-'}\ndata: ${event.data}\n\n`);
+            if (terminal) throw new Error('Output after terminal event');
+            const parsed = parseEventData(event.data);
+            if (!parsed) throw new Error('Invalid upstream SSE event');
+            session?.event(parsed);
+            const frames = convert(parsed);
+            if (parsed.type === 'response.completed') {
+                // Terminal frames carry no new visible content. Validate their exact queued bytes
+                // before publication; delivery remains pending until those bytes finish locally.
+                for (const frame of frames) session?.frame(frame);
+                session?.complete(parsed.response);
+                terminal = true;
+            } else if (['response.incomplete', 'response.failed', 'error'].includes(parsed.type)) {
+                session?.finishWithoutCapture();
+                terminal = true;
+            }
+            if (terminal) transport?.beginDelivery();
+            for (const frame of frames) {
+                if (log.enabled) clientFrames.push(frame);
+                // Recording and write submission are synchronous; a write failure poisons in finally.
+                if (parsed.type !== 'response.completed') session?.frame(frame);
+                await writeClientFrame(res, frame, transport?.limits.deliveryTimeoutMs);
+            }
+            if (terminal) break;
         }
+        if (!terminal) throw new Error('Upstream stream ended before its terminal event');
+        session?.ensureCompleted();
+        res.end();
+    } catch (error) {
+        session?.abort();
+        throw error;
+    } finally {
+        session?.ensureCompleted();
+        await log.write('3-upstream-response.sse', upstreamFrames.text());
+        await log.write('4-client-response.sse', clientFrames.text());
     }
-    res.end();
-    await log.write('3-upstream-response.sse', upstreamFrames.join(''));
-    await log.write('4-client-response.sse', clientFrames.join(''));
 };
 
-export const sendConvertedJson = async (upstream: Response, res: ServerResponse, log: RequestLog): Promise<void> => {
-    const upstreamText = await upstream.text();
-    const converted = toChatCompletion(JSON.parse(upstreamText) as ResponsesObject);
+export const sendConvertedJson = async (
+    upstream: Response, res: ServerResponse, log: RequestLog, session?: ReplaySession | null, transport?: RequestTransport,
+): Promise<void> => {
+    const upstreamText = await readResponseText(upstream, () => { transport?.progress(); session?.progress(); }, transport?.limits.maxResponseBytes);
+    const response = JSON.parse(upstreamText) as ResponsesObject;
+    if (!response || typeof response !== 'object' || Array.isArray(response)) throw new Error('Invalid upstream response');
+    if (response.error || response.status === 'failed') {
+        session?.finishWithoutCapture(); transport?.beginDelivery();
+        sendJson(res, 502, { error: response.error ?? { message: 'Upstream response failed', type: 'upstream_error' } });
+        await log.write('3-upstream-response.json', upstreamText);
+        return;
+    }
+    if (response.status !== undefined && !['completed', 'incomplete'].includes(response.status)) {
+        throw new Error('Upstream JSON response is not terminal');
+    }
+    const converted = toChatCompletion(response);
+    session?.json(converted);
+    session?.complete(response); transport?.beginDelivery();
     sendJson(res, 200, converted);
     await log.write('3-upstream-response.json', upstreamText);
     await log.write('4-client-response.json', JSON.stringify(converted, null, 2));
 };
 
-/** Pipes an upstream response unchanged (used for non-converted paths such as /v1/models). */
-export const pipePassthrough = async (upstream: Response, res: ServerResponse, log: RequestLog): Promise<void> => {
-    const contentType = upstream.headers.get('content-type') ?? 'application/octet-stream';
-    res.writeHead(upstream.status, { 'content-type': contentType });
-    const chunks: Buffer[] = [];
-    for await (const chunk of upstream.body ?? new ReadableStream<Uint8Array>()) {
-        chunks.push(Buffer.from(chunk));
-        res.write(chunk);
+export const pipePassthrough = async (upstream: Response, res: ServerResponse, log: RequestLog, transport?: RequestTransport): Promise<void> => {
+    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/octet-stream' });
+    const capture = createLogBuffer(log.enabled);
+    for await (const chunk of bodyChunks(upstream.body, transport?.progress)) {
+        capture.push(chunk);
+        await writeClientFrame(res, chunk, transport?.limits.deliveryTimeoutMs);
     }
-    res.end();
-    const body = Buffer.concat(chunks).toString('utf8');
-    await log.write('3-upstream-response.txt', body);
-    await log.write('4-client-response.txt', body);
+    transport?.beginDelivery(); res.end();
+    await log.write('3-upstream-response.txt', capture.text());
+    await log.write('4-client-response.txt', capture.text());
 };
 
-export const relayUpstreamError = async (
-    upstream: Response,
-    res: ServerResponse,
-    log: RequestLog,
-    requestId: string,
-): Promise<void> => {
-    const errorBody = await upstream.text();
-    logLine(`${requestId} upstream error body: ${truncate(errorBody)}`);
+export const relayUpstreamError = async (upstream: Response, res: ServerResponse, log: RequestLog, requestId: string,
+    transport?: RequestTransport, session?: ReplaySession | null): Promise<void> => {
+    const errorBody = await readResponseText(upstream, () => { transport?.progress(); session?.progress(); }, transport?.limits.maxResponseBytes);
+    session?.finishWithoutCapture(); transport?.beginDelivery();
+    logLine(`${requestId} upstream error status=${upstream.status}`);
     res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
     res.end(errorBody);
     await log.write('3-upstream-error.json', errorBody);

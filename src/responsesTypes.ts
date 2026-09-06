@@ -12,7 +12,12 @@ export type ResponsesOutputItem = {
     call_id?: string;
     name?: string;
     arguments?: string;
-    content?: Array<{ type: string; text?: string }>;
+    role?: string;
+    status?: string;
+    phase?: string;
+    encrypted_content?: string | null;
+    summary?: Array<{ type: string; text?: string }>;
+    content?: Array<{ type: string; text?: string; refusal?: string; annotations?: unknown[]; logprobs?: unknown[] }>;
 };
 
 export type ResponsesObject = {
@@ -32,7 +37,12 @@ export type ResponsesStreamEvent = {
     response?: ResponsesObject;
     item?: ResponsesOutputItem;
     item_id?: string;
+    output_index?: number;
+    content_index?: number;
     delta?: string;
+    arguments?: string;
+    text?: string;
+    refusal?: string;
     code?: string;
     message?: string;
     param?: string | null;

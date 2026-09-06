@@ -95,7 +95,10 @@ can rotate the relay token without touching OpenAI.
 
 ## Use case 3: See exactly what Cursor sends and receives
 
-Set `LOG_BODIES=1` and every request produces four files in `logs/` sharing one timestamp+id prefix:
+Set `LOG_BODIES=1` to attempt diagnostic artifacts in `logs/` sharing one timestamp+id prefix.
+Writes are best-effort, limited to 8 MiB per artifact, and may be omitted under I/O failure, a two-second
+write timeout, or the four-write global concurrency cap. Truncated artifacts carry an explicit marker.
+Directories are owner-only (`0700`), artifacts `0600`, and diagnostic failures do not fail model calls:
 
 | File                       | Content                                                   |
 | -------------------------- | --------------------------------------------------------- |
@@ -104,11 +107,10 @@ Set `LOG_BODIES=1` and every request produces four files in `logs/` sharing one 
 | `3-upstream-response.sse`  | raw Responses API event stream from OpenAI                |
 | `4-client-response.sse`    | Chat Completions chunks returned to Cursor                |
 
-Request *shape* and *content* are logged separately on purpose. The console always prints one line
-per request with path, translation, model alias resolution, effort, top-level body keys, origin IP,
-user agent, upstream status, OpenAI `x-request-id`, time to first byte and total duration – but never
-prompt content. Fields the translation does not know show up as `dropped=[...]`. Only `LOG_BODIES=1`
-writes content, and the relay prints a warning at startup while it is on.
+Operational diagnostics and content are separated. The console reports request IDs, upstream status,
+conversion state, and replay replacement counts, but does not print upstream error bodies, prompts,
+raw history digests, or encrypted payloads. Only `LOG_BODIES=1` writes content; the relay warns at startup.
+The upstream-request artifact contains the actual dispatched bytes, including any verified replacements.
 
 The log files contain your prompts, repository contents and answers. Turn `LOG_BODIES` off when you
 are done debugging and delete `logs/`.
@@ -205,17 +207,210 @@ Relay experiments tend to live longer than intended. Treat this one accordingly:
 ## Limitations
 
 - Prompt assembly still happens in Cursor's backend; only the hop to OpenAI runs on your machine.
-- Reasoning summaries and `reasoning.encrypted_content` cannot be returned through Chat Completions
-  chunks, so the model does not see its previous reasoning in later turns (answers and tool results
-  are preserved).
+- Reasoning is not exposed through Chat Completions. The optional local replay cache can restore
+  verified original reasoning blocks upstream; without it, only visible history is preserved.
+- Replay cannot distinguish every identical visible branch, and scope changes or unobserved traffic
+  can cause misses or leave attribution unknowable. No quality, cost, or hit-rate improvement is promised.
+- A bounded live `gpt-6-astra` high-effort smoke test verified encrypted replay across restart and
+  SSE/JSON transitions on 2026-09-06. This is not a guarantee for month-old ciphertext, large contexts,
+  other models, concurrent traffic, or the actual Cursor/ngrok deployment.
 - The tunnel must not buffer SSE (see the tunnel note in use case 1). ngrok's browser interstitial does
   not affect API traffic.
+
+## Optional: persistent encrypted reasoning replay
+
+Set `REASONING_CACHE_ENABLED=1` only after validating your model and Cursor configuration. The cache
+uses Node's built-in SQLite driver (tested on Node 24.14.1, which emits an experimental warning).
+It hashes complete visible message prefixes, including call IDs, and restores whole original output
+blocks only when their visible envelope and actual dispatched ancestry verify. It never decrypts
+reasoning and never automatically retries an upstream error.
+
+- Default database: `data/reasoning-cache.sqlite`, with an adjacent persistent fingerprint secret.
+  Keep the whole directory private. Assistant text and tool arguments are plaintext even though
+  reasoning is encrypted. The data directory is excluded from Git.
+- Enabled eligible requests use `store: false` and request encrypted reasoning, including cache misses.
+  This is not a guarantee of zero provider retention.
+- Payloads are reclaimed only after at least 30 idle days and when no retained descendant needs them.
+  Conflict/poison markers survive payload reclamation. Quota pressure stops admission, not active-data retention.
+  Emergency storage has a 64 KiB minimum. If safety writes cannot be committed, dispatch stops and a
+  `.guard` failure latch prevents reopening; do not delete it to bypass the failure.
+- Every restart conservatively postpones deletion until 30 trusted days have elapsed. Frequent restarts
+  can keep data longer. Clock uncertainty postpones deletion again; replay can continue.
+- Disabling an existing cache records an observation gap before serving traffic and retains the exclusive
+  store lock until shutdown; an enabled second instance cannot clear the gap while disabled traffic is
+  still running. Re-enabling quarantines pre-gap payloads. Never-enabled installations create no database. Do not reuse stores across older
+  relay versions that lack this transition guard.
+- Stops, failed/incomplete streams, and unresolved crash intents poison the affected prefix position,
+  not unrelated histories. Identical visible histories and unobserved generations remain limitations.
+- Initial/generation inactivity defaults to 15 minutes and renews on received bytes. Delivery has a
+  separate 30-second deadline. Neither is a total lifetime limit on a progressing generation.
+- The default 128 MiB cache budget supports up to eight small cached requests concurrently. Admission
+  uses measured history size, a bounded capture allowance, and one shared synchronous preparation
+  workspace—not 124 MiB per request. Larger requests can reduce the number cached simultaneously.
+- **Cache busy means cache bypass, not a failed model call.** Excess requests forward normally without
+  replay/capture after a small durable start-position marker prevents stale reasoning reuse there.
+  This sacrifices cache continuity at that position, not unrelated histories; later turns can rebuild it.
+  `REASONING_CACHE_MAX_CONCURRENT` caps full caching, not relay request concurrency. Bypassed
+  calls still receive the relay-wide inactivity and downstream-write deadlines, independently of cache sessions.
+  Diagnostics distinguish `memory` from `maxConcurrent` bypasses and report active leases.
+- An enabled cache configuration must fit its shared preflight and revalidation workspace before
+  the relay starts; an impossibly small budget is a configuration error, not uncapped guard work.
+  Reservations are estimates of cache-owned allocations, not a process-wide RSS limit.
+- A genuine failure to persist safety metadata still fails closed, reported as HTTP 503
+  `relay_cache_unavailable` rather than a misleading upstream-connectivity error. This is different
+  from normal cache pressure, which does not reject the request.
+- Store JSON parsing remains conservatively bounded. Body-log buffers are created only with
+  `LOG_BODIES=1`; ordinary streaming no longer retains both entire SSE streams for disabled logging.
+  Existing raw request and JSON-response buffering remain outside the cache-specific memory budget.
+- `LOG_BODIES=1` also logs restored payloads. Those logs are independent of cache retention.
+
+All cache controls are documented in `.env.example`; advanced `REASONING_CACHE_HISTORY_MAX_*` and
+`REASONING_CACHE_SCRATCH_MAX_BYTES` limits are loaded in `src/reasoning/config.ts`. Changing canonical
+limits changes the scope and may make older data unreachable without deleting it.
+
+### Offline backup and restore
+
+From a separate session that does **not** depend on the relay, stop the owning process first.
+The administration command refuses an active owner and never overwrites a destination:
+
+```bash
+pnpm cache:admin backup data/reasoning-cache.sqlite private-backup/cache.sqlite
+pnpm cache:admin restore private-backup/cache.sqlite recovered/cache.sqlite
+```
+
+Both operations preserve the adjacent secret and mark an observation gap so even direct activation
+of a backup quarantines pre-snapshot payloads; a new 30-trusted-day deletion barrier applies.
+A durable `.blocked` marker prevents opening a destination if snapshot publication is interrupted.
+Do not remove `.blocked` or a latched `.guard` to bypass a failed recovery. Select the restored path
+explicitly in configuration only during a separately authorized cutover. A backup cannot reconstruct
+observations made after its snapshot. Keep backup/recovery directories out of Git and private.
+
+### Offline validation and safe rollout
+
+```bash
+pnpm typecheck
+pnpm test        # synthetic fixtures, temporary databases, fake upstreams, concurrency 1
+```
+
+Do not test a new branch by changing the checkout that serves your current agent session. Use a
+separate worktree with its own dependencies and synthetic configuration. Tests do not load `.env`
+or start ngrok; all servers use ephemeral loopback ports. Live provider tests and any deployment
+switchover require separate authorization and a session that does not rely on the relay being replaced.
+
+### Explicitly authorized live smoke test
+
+`tests/live-smoke.ts` is deliberately excluded from `pnpm test`. It reads only the OpenAI key from an
+explicit key file, uses an independent relay token and OS-assigned loopback port, and never starts
+ngrok or changes the serving checkout. Four calls are capped at 4,096 output tokens each; API usage
+is billable. It saves private synthetic request/response logs and a redacted `summary.json` under a
+new `/tmp/openai-replay-live-*` directory and stops its listeners in `finally`.
+
+```bash
+ALLOW_BILLABLE_REPLAY_SMOKE=1 REPLAY_SMOKE_KEY_FILE=/absolute/path/to/key.env node tests/live-smoke.ts
+```
+
+The first live run found that OpenAI can supply different encrypted bytes for the same reasoning
+item in `output_item.done` and `response.completed`. The completed ciphertext is now authoritative
+only when all non-ciphertext fields match. The corrected run verified one exact original block
+accepted after restart and two exact original blocks accepted on the following streaming request.
+The initial simple tool call produced no reasoning item; it was correctly not admitted as a payload.
+
+### Concurrent-request validation
+
+The simplified policy was verified with eight overlapping requests against a fake upstream, then
+four real `gpt-6-astra-high` calls on an isolated loopback listener. Two concurrent live requests both
+used caching; with full-cache concurrency forced to one, the second request bypassed caching and
+both still returned HTTP 200 with correct streamed answers. No test listener or tunnel was left running.
+A 5.69 MiB synthetic tool history also completed offline; this is not an exhaustive load benchmark.
+
+`tests/live-concurrency.ts` uses the same explicit billable opt-in and key-file variables as the smoke
+test. It is excluded from the automatic test suite. The actual Cursor/ngrok cutover remains a separate
+operator-controlled action; these tests never change routing or restart the serving relay.
+
+### Broader real-service acceptance (2026-09-06)
+
+`tests/live-acceptance.ts` runs 20 explicitly authorized generation requests against isolated
+loopback listeners and the real OpenAI service. `tests/live-acceptance-recheck.ts` exercises token
+exhaustion/cancellation; `tests/live-acceptance-extended.ts` covers concurrent restart replay,
+identical-visible-answer ambiguity, observe-only competitors, and a roughly 24k-input-token context.
+All are excluded from `pnpm test` and require the same explicit billable opt-in/key-file variables.
+
+The latest full run passed all 21 checks. Focused extensions passed after correcting two test
+assumptions (unsupported Astra effort `none`, and a miscomputed fixture expectation). The first
+run also exposed a relay bug: JSON token exhaustion was reported as `stop`; it now correctly
+returns `length`. Incomplete/error SSE terminals poison cache state without prematurely aborting
+terminal delivery. Cancellation was tested both after visible text and during reasoning, with
+zero active sessions/intents verified before shutdown.
+
+The exercise attempted 64 generation requests, including rejected/canceled calls and reruns.
+No serving checkout, tunnel, or Cursor routing was modified. All owned listeners were closed.
+The local suite passes 128 tests. Power-loss durability, month-old ciphertext, sustained load,
+and an actual Cursor/tunnel cutover are not established by these live checks; use a controlled
+switchover with a rollback path rather than treating acceptance as a no-failure guarantee.
+
+### Deeper adversarial round (2026-09-06)
+
+A subsequent round attempted 152 real requests, including focused rechecks and one direct-provider
+image comparison. The corrected deep suite passed 24 scenario groups across 64 requests: four
+five-turn conversations with restarts, ten-way concurrency under a two-slot cache, Unicode tool
+arguments, three tool rounds, cache-isolation mutations, identical-answer ambiguity, actual partial
+tool-argument truncation, repeated cancellation, and capacity/quota fallbacks. The final four-call
+replay smoke passed after protocol fixes. The offline suite now has 150 passing tests.
+
+Fault injection uncovered and fixed three boundary problems: malformed generation bodies now
+return local 400 errors rather than mapper failures; broken/missing-terminal SSE fails transport
+rather than ending HTTP successfully; failed/nonterminal JSON responses cannot masquerade as
+successful empty Chat answers. Synthetic upstreams cover 429/500, failed streams, malformed SSE,
+socket resets, and inactivity deadlines without trying to cause real provider outages.
+
+**Unresolved:** a positive solid-red PNG interpretation check returned incorrect/imprecise colors,
+including when the same input bypassed the relay and went directly to OpenAI. Conversion input
+matched exactly, but the cause of that synthetic-image anomaly is not established. A later ordinary-photo comparison and exact-choice controls passed (see below); the earlier failure is retained as evidence, not treated as a general failure of image forwarding.
+No suite covers every possible edge case or replaces a real Cursor/tunnel canary and sustained-load
+monitoring. All temporary test listeners were stopped and the serving checkout was untouched.
+
+### Transport and diagnostics hardening after the delayed audit
+
+Additional local regressions cover bodyless HEAD/204 passthrough, uncached-request timeouts,
+per-write backpressure deadlines, uploads/event/JSON size ceilings, post-DONE suppression, and
+private nonfatal logging. Explicit `store:false` and `include` survive disabled/observe-only/bypassed
+Chat translation. Refusal-only JSON preserves its refusal text. Missing/invalid message roles and
+malformed tool shapes return local 400 rather than acquiring mapper defaults.
+
+Transport defaults apply independently of caching: 64 MiB requests, 64 MiB buffered JSON/error
+responses, 8 MiB per SSE event, 15-minute upstream inactivity and 30-second delivery/write deadlines.
+Configure `RELAY_MAX_REQUEST_BYTES`, `RELAY_MAX_RESPONSE_BYTES`, `RELAY_MAX_SSE_EVENT_BYTES`,
+`RELAY_IDLE_TIMEOUT_MS`, and `RELAY_DELIVERY_TIMEOUT_MS` for legitimate larger workloads. Oversized
+requests get HTTP 413; broken/oversized upstream streams fail rather than silently succeeding.
+These are per-request/operation bounds, not a global process RSS guarantee. Cache size limits do
+not substitute for transport limits.
+
+A final 20-request live acceptance rerun passed all 21 checks on this transport-hardened code,
+bringing the deeper exercise to 172 requests. The current offline suite passes 193 tests. All
+owned test listeners were stopped, and no serving process or routing was changed. The positive
+image-interpretation limitation above remains unresolved.
+
+### Ordinary photo and exact-choice visual checks (2026-09-06)
+
+Three fixed JPEGs from [Lorem Picsum](https://picsum.photos/) (IDs 237, 1025 and 10) were sent as
+inline image data, with identical request bodies compared through the isolated relay and directly
+to OpenAI. All six descriptions correctly identified the two dogs and the forest/water landscape.
+The forwarded image bytes were identical to the downloaded fixtures.
+
+A subsequent exact-choice test used shuffled answer positions, neutral identifiers, and a no-image
+control. All ten answers (five relay, five direct) matched the required single uppercase letter
+exactly—no trimming or substring scoring. The no-image case correctly chose cannot-determine.
+This validates broad photo classification for these fixtures, not general OCR, screenshot accuracy,
+or the cause of the earlier tiny flat-color PNG anomaly. Harnesses `tests/live-picsum.ts` and
+`tests/live-image-choice.ts` are manual, billable opt-ins and never run under `pnpm test`.
 
 ## Development
 
 ```bash
 pnpm typecheck   # tsc --noEmit
-pnpm start       # node --env-file=.env src/server.ts (Node 24 runs TypeScript directly)
+pnpm test
+pnpm start       # starts the configured relay and possibly ngrok; not a test command
 ```
 
-No build step, no runtime dependencies besides `@ngrok/ngrok`. All source files live in `src/`.
+No build step or added database dependency. The server factory in `src/app.ts` is importable without
+loading `.env`, binding a port, or starting a tunnel.

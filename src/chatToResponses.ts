@@ -26,7 +26,7 @@ const toToolChoice = (toolChoice: unknown): unknown => {
     return nested ? { type: 'function', name: nested.name } : toolChoice;
 };
 
-const directlyMappedKeys = ['model', 'stream', 'temperature', 'top_p', 'parallel_tool_calls', 'metadata'] as const;
+const directlyMappedKeys = ['model', 'stream', 'temperature', 'top_p', 'parallel_tool_calls', 'metadata', 'store', 'include'] as const;
 const handledKeys = new Set<string>([
     ...directlyMappedKeys,
     'messages',

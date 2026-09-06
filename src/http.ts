@@ -2,12 +2,20 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 export type JsonBody = Record<string, unknown>;
 
-export const readBody = async (req: IncomingMessage): Promise<Buffer> => {
+export class RequestBodyLimitError extends Error {}
+
+export const readBody = async (req: IncomingMessage, maxBytes = 64 * 1024 * 1024, progress?: () => void): Promise<Buffer> => {
     const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    let bytes = 0;
+    // Non-destroying early return lets us send an explicit 413 for oversized chunked bodies.
+    for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+        progress?.();
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        if (buffer.length > maxBytes - bytes) throw new RequestBodyLimitError('Request body exceeds relay limit');
+        bytes += buffer.length;
+        chunks.push(buffer);
     }
-    return Buffer.concat(chunks);
+    return Buffer.concat(chunks, bytes);
 };
 
 export const parseJsonBody = (raw: Buffer, contentType: string | undefined): JsonBody | null => {
@@ -35,10 +43,10 @@ export const sendJson = (res: ServerResponse, status: number, payload: unknown):
 /** Aborts when the client goes away before the response is finished (e.g. "Stop" in Cursor). */
 export const abortOnClientDisconnect = (res: ServerResponse): AbortSignal => {
     const controller = new AbortController();
-    res.on('close', () => {
-        if (!res.writableFinished) {
-            controller.abort();
-        }
+    res.once('close', () => {
+        if (!res.writableFinished) controller.abort();
     });
+    res.once('error', () => controller.abort());
+    if (res.destroyed) controller.abort();
     return controller.signal;
 };

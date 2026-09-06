@@ -43,7 +43,7 @@ const toFunctionCall = (toolCall: ChatToolCall): JsonBody => ({
 });
 
 /** Translates one Chat Completions message into zero or more Responses API input items. */
-const toInputItems = (message: ChatMessage): JsonBody[] => {
+export const chatMessageToInput = (message: ChatMessage): JsonBody[] => {
     switch (message.role) {
         case 'tool':
             return [{ type: 'function_call_output', call_id: message.tool_call_id, output: toInputContent(message.content) }];
@@ -60,4 +60,4 @@ const toInputItems = (message: ChatMessage): JsonBody[] => {
 };
 
 export const chatMessagesToInput = (messages: unknown): JsonBody[] =>
-    Array.isArray(messages) ? (messages as ChatMessage[]).flatMap(toInputItems) : [];
+    Array.isArray(messages) ? (messages as ChatMessage[]).flatMap(chatMessageToInput) : [];

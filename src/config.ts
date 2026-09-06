@@ -1,4 +1,10 @@
+import { loadCacheConfig } from './reasoning/config.ts';
+import type { CacheConfig } from './reasoning/types.ts';
+import type { TransportLimits } from './transport.ts';
+
 export type RelayConfig = {
+    transport?: Partial<TransportLimits>;
+    cache: CacheConfig;
     host: string;
     port: number;
     relayToken: string;
@@ -16,6 +22,14 @@ export type RelayConfig = {
     logDir: string;
 };
 
+const optionalTransportLimit = (name: string): number | undefined => {
+    const raw = process.env[name];
+    if (raw === undefined) return undefined;
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
+    return value;
+};
+
 const requireEnv = (name: string): string => {
     const value = process.env[name];
     if (!value) {
@@ -25,6 +39,14 @@ const requireEnv = (name: string): string => {
 };
 
 export const loadConfig = (): RelayConfig => ({
+    cache: loadCacheConfig(),
+    transport: Object.fromEntries([
+        ['maxRequestBytes', optionalTransportLimit('RELAY_MAX_REQUEST_BYTES')],
+        ['maxResponseBytes', optionalTransportLimit('RELAY_MAX_RESPONSE_BYTES')],
+        ['maxSseEventBytes', optionalTransportLimit('RELAY_MAX_SSE_EVENT_BYTES')],
+        ['idleTimeoutMs', optionalTransportLimit('RELAY_IDLE_TIMEOUT_MS')],
+        ['deliveryTimeoutMs', optionalTransportLimit('RELAY_DELIVERY_TIMEOUT_MS')],
+    ].filter((entry) => entry[1] !== undefined)),
     host: process.env.HOST ?? '127.0.0.1',
     port: Number(process.env.PORT ?? 8787),
     relayToken: requireEnv('RELAY_TOKEN'),

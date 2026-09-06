@@ -21,11 +21,7 @@ export const startTunnel = async (config: RelayConfig): Promise<string | null> =
     if (!publicUrl) {
         throw new Error('ngrok did not return a public URL');
     }
-    const shutdown = async () => {
-        await ngrok.disconnect();
-        process.exit(0);
-    };
-    process.once('SIGINT', shutdown);
-    process.once('SIGTERM', shutdown);
     return publicUrl;
 };
+
+export const stopTunnel = async (): Promise<void> => { await ngrok.disconnect(); };

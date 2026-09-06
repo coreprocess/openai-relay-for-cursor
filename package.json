@@ -13,7 +13,9 @@
     },
     "scripts": {
         "start": "node --env-file=.env src/server.ts",
-        "typecheck": "tsc --noEmit"
+        "typecheck": "tsc --noEmit",
+        "test": "node --test --test-concurrency=1 tests/*.test.ts",
+        "cache:admin": "node src/reasoning/admin.ts"
     },
     "dependencies": {
         "@ngrok/ngrok": "^1.7.0"
