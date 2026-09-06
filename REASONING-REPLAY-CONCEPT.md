@@ -188,6 +188,12 @@ With `LOG_BODIES=1`, diagnostic content is sensitive and written best-effort:
 
 Diagnostic failures do not intentionally fail model calls. Logs may be incomplete and are not governed by cache retention.
 
+Converted streaming responses also emit SSE keepalive comments during downstream silence (15 seconds
+by default, `RELAY_SSE_KEEPALIVE_MS=0` disables). These comments are excluded from assistant output
+and capture; they do not renew upstream deadlines or count as model progress. Terminal output,
+disconnect and error paths stop the heartbeat. Failure logs carry request IDs, fixed safe reason
+codes and stream/disconnect timing rather than raw exception text.
+
 ## 9. Configuration and effective limits
 
 Defaults from `src/reasoning/config.ts`:

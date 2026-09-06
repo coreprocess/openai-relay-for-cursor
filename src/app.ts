@@ -1,7 +1,6 @@
 import { createServer } from 'node:http';
 import type { RelayConfig } from './config.ts';
 import { sendJson, RequestBodyLimitError } from './http.ts';
-import { logLine } from './log.ts';
 import { ReplayRuntime } from './reasoning/runtime.ts';
 import { CacheUnavailableError } from './reasoning/admission.ts';
 import { handleRequest } from './requestHandler.ts';
@@ -17,7 +16,6 @@ export const createRelay = (config: RelayConfig) => {
     const server = createServer((req, res) => {
         handleRequest(config, runtime, req, res).catch((error: unknown) => {
             runtime.metrics.requestFailures++;
-            logLine('relay request failed');
             if (res.headersSent) { if (!res.writableFinished) res.destroy(); return; }
             if (error instanceof RequestBodyLimitError) {
                 res.setHeader('connection', 'close');

@@ -1,3 +1,5 @@
+import { RelayFailure } from './failure.ts';
+
 export type SseEvent = { event: string | null; data: string };
 
 const parseEvent = (rawEvent: string): SseEvent | null => {
@@ -23,13 +25,13 @@ export async function* readSseEvents(body: AsyncIterable<Uint8Array>, maxEventBy
             append(decoder.decode(chunk.subarray(offset, offset + 16_384), { stream: true }));
             let index = buffer.indexOf('\n\n');
             while (index !== -1) {
-                if (Buffer.byteLength(buffer.slice(0, index)) > maxEventBytes) throw new Error('Upstream SSE event exceeds relay limit');
+                if (Buffer.byteLength(buffer.slice(0, index)) > maxEventBytes) throw new RelayFailure('upstream_sse_limit');
                 const event = parseEvent(buffer.slice(0, index));
                 buffer = buffer.slice(index + 2);
                 if (event) yield event;
                 index = buffer.indexOf('\n\n');
             }
-            if (Buffer.byteLength(buffer) > maxEventBytes) throw new Error('Upstream SSE event exceeds relay limit');
+            if (Buffer.byteLength(buffer) > maxEventBytes) throw new RelayFailure('upstream_sse_limit');
         }
     }
     append(decoder.decode());

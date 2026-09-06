@@ -1,3 +1,5 @@
+import { RelayFailure } from './failure.ts';
+
 /** Observe raw body progress before SSE parsing, including heartbeats and partial frames. */
 export async function* bodyChunks(body: ReadableStream<Uint8Array> | null, progress?: () => void): AsyncGenerator<Uint8Array> {
     if (!body) return;
@@ -12,7 +14,7 @@ export const readResponseText = async (response: Response, progress?: () => void
     let text = '';
     let bytes = 0;
     for await (const chunk of bodyChunks(response.body, progress)) {
-        if (chunk.byteLength > maxBytes - bytes) throw new Error('Upstream response exceeds relay limit');
+        if (chunk.byteLength > maxBytes - bytes) throw new RelayFailure('upstream_body_limit');
         bytes += chunk.byteLength;
         text += decoder.decode(chunk, { stream: true });
     }

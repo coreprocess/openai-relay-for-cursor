@@ -11,6 +11,7 @@ import { planUpstreamRequest } from './rewrite.ts';
 import { forwardToUpstream } from './upstream.ts';
 import { validateGenerationBody } from './requestValidation.ts';
 import { RequestTransport, transportLimits } from './transport.ts';
+import { safeFailure } from './failure.ts';
 
 export const handleRequest = async (config: RelayConfig, runtime: ReplayRuntime, req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const method = req.method ?? 'GET';
@@ -24,6 +25,7 @@ export const handleRequest = async (config: RelayConfig, runtime: ReplayRuntime,
     const requestId = randomUUID().slice(0, 8);
     const log = createRequestLog(config.logBodies, config.logDir, requestId);
     let session: ReplaySession | null = null;
+    let upstreamSignal: AbortSignal | undefined;
     try {
         const rawBody = await readBody(req, transport.limits.maxRequestBytes, transport.progress);
         const json = parseJsonBody(rawBody, req.headers['content-type']);
@@ -39,10 +41,12 @@ export const handleRequest = async (config: RelayConfig, runtime: ReplayRuntime,
         session?.bind(res);
         if (signal.aborted || res.destroyed) throw new Error('Client disconnected');
         const combinedSignal = session ? AbortSignal.any([signal, session.controller.signal]) : signal;
+        upstreamSignal = combinedSignal;
         const payload = prepared.payload ?? (plan.body ? Buffer.from(JSON.stringify(plan.body)) : rawBody.length ? rawBody : null);
         // Intent transaction and transport invocation stay in one synchronous turn.
         const pending = forwardToUpstream(config, method, plan.path, req.headers, payload, combinedSignal);
         const upstream = await pending;
+        transport.receivedHeaders(upstream.status);
         runtime.metrics.upstreamResponses++;
         if (!upstream.ok) runtime.metrics.upstreamHttpErrors++;
         transport.progress(); session?.progress();
@@ -57,7 +61,11 @@ export const handleRequest = async (config: RelayConfig, runtime: ReplayRuntime,
         if (json?.stream === true) await streamConverted(upstream, res, log, session, transport);
         else await sendConvertedJson(upstream, res, log, session, transport);
     } catch (error) {
-        transport.abort(); session?.abort(); throw error;
+        // Collect causes before cleanup aborts would replace the original failure context.
+        const reason = upstreamSignal?.aborted ? upstreamSignal.reason :
+            transport.controller.signal.aborted ? transport.controller.signal.reason : undefined;
+        logLine(`${requestId} relay request failed ${JSON.stringify({ ...safeFailure(error, reason), ...transport.diagnostics() })}`);
+        transport.abort(error); session?.abort(error); throw error;
     } finally {
         session?.ensureCompleted(); session?.requestFinished();
     }

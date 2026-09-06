@@ -490,6 +490,33 @@ All test-owned listeners were stopped. Snapshot duration was 58 ms for this smal
 this does not establish performance for large production stores. Deployment still requires a separate
 planned restart and a check of the actual admin socket afterward.
 
+## Reasoning-only streams and keepalives
+
+Converted Chat Completions SSE streams send `: keepalive` comment frames after 15 seconds without
+a downstream data write. Configure `RELAY_SSE_KEEPALIVE_MS` (milliseconds); `0` disables it.
+The defaults are covered by timer tests. A local real-socket test reproduces reasoning-only traffic
+outlasting a downstream idle deadline; keepalives keep it connected, while disabled keepalives do
+not. A two-call OpenAI smoke test at an accelerated 250 ms interval also verified comment delivery,
+normal terminal output, and exact reasoning replay. This is not a live test of Cursor's three-minute
+threshold through ngrok; the deployed result should be checked after a planned restart.
+
+Keepalives are protocol comments, not assistant text or fabricated model chunks, and do not enter
+visible-history hashing or reasoning capture. They stop before terminal output, on disconnect,
+and on errors. Slow downstream writes remain bounded; heartbeat work cannot queue without limit.
+
+This prevents network-idle timeouts while OpenAI emits reasoning items that are not exposed to
+Cursor. It does not override a client's absolute or meaningful-output timeout, and it does **not**
+renew upstream inactivity or cache deadlines. A stalled upstream still times out normally.
+The behavior applies to converted streaming requests whether cache capture is active or bypassed;
+it does not inject comments into JSON or arbitrary passthrough bodies.
+
+Failure logs now include the request ID and sanitized reason codes, upstream status, elapsed time,
+time since headers/last upstream progress, last client-data timing, visible-frame/keepalive counts,
+and whether downstream closed before local finish. Only allowlisted exception names/error codes
+are emitted; raw exception messages, URLs, prompt text and ciphertext are excluded. This lets an
+operator distinguish client disconnects, upstream failures, backpressure and local watchdog expiry
+without assuming that upstream HTTP 200 meant the stream completed.
+
 ## Development
 
 ```bash

@@ -30,7 +30,9 @@ const optionalTransportLimit = (name: string): number | undefined => {
     const raw = process.env[name];
     if (raw === undefined) return undefined;
     const value = Number(raw);
-    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
+    if (!Number.isSafeInteger(value) || value < (name === 'RELAY_SSE_KEEPALIVE_MS' ? 0 : 1)) {
+        throw new Error(`${name} must be a valid nonnegative interval or positive size`);
+    }
     return value;
 };
 
@@ -52,6 +54,7 @@ export const loadConfig = (): RelayConfig => ({
         ['maxSseEventBytes', optionalTransportLimit('RELAY_MAX_SSE_EVENT_BYTES')],
         ['idleTimeoutMs', optionalTransportLimit('RELAY_IDLE_TIMEOUT_MS')],
         ['deliveryTimeoutMs', optionalTransportLimit('RELAY_DELIVERY_TIMEOUT_MS')],
+        ['sseKeepaliveMs', optionalTransportLimit('RELAY_SSE_KEEPALIVE_MS')],
     ].filter((entry) => entry[1] !== undefined)),
     host: process.env.HOST ?? '127.0.0.1',
     port: Number(process.env.PORT ?? 8787),

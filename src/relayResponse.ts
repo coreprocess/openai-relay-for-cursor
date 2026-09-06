@@ -9,6 +9,8 @@ import { bodyChunks, readResponseText } from './progressBody.ts';
 import type { ReplaySession } from './reasoning/session.ts';
 import type { ResponsesObject, ResponsesStreamEvent } from './responsesTypes.ts';
 import { readSseEvents } from './sse.ts';
+import { createSseWriter } from './sseWriter.ts';
+import { RelayFailure } from './failure.ts';
 
 const parseEventData = (data: string): ResponsesStreamEvent | null => {
     try { return JSON.parse(data) as ResponsesStreamEvent; } catch { return null; }
@@ -23,17 +25,23 @@ export const streamConverted = async (
     const upstreamFrames = createLogBuffer(log.enabled);
     const clientFrames = createLogBuffer(log.enabled);
     const convert = createResponsesToChatStreamConverter();
+    const writer = createSseWriter(res, {
+        intervalMs: transport?.limits.sseKeepaliveMs, writeTimeoutMs: transport?.limits.deliveryTimeoutMs,
+        onKeepalive: (frame) => { if (log.enabled) clientFrames.push(frame); transport?.keepalive(); },
+        onError: (error) => { transport?.abort(error); session?.abort(error); res.destroy(); },
+    });
     let terminal = false;
     try {
         for await (const event of readSseEvents(bodyChunks(upstream.body, () => {
             transport?.progress(); session?.progress();
         }), transport?.limits.maxSseEventBytes)) {
             if (log.enabled) upstreamFrames.push(`event: ${event.event ?? '-'}\ndata: ${event.data}\n\n`);
-            if (terminal) throw new Error('Output after terminal event');
+            if (terminal) throw new RelayFailure('upstream_protocol_error');
             const parsed = parseEventData(event.data);
-            if (!parsed) throw new Error('Invalid upstream SSE event');
+            if (!parsed) throw new RelayFailure('upstream_protocol_error');
             session?.event(parsed);
             const frames = convert(parsed);
+            if (['response.completed', 'response.incomplete', 'response.failed', 'error'].includes(parsed.type)) writer.stop();
             if (parsed.type === 'response.completed') {
                 // Terminal frames carry no new visible content. Validate their exact queued bytes
                 // before publication; delivery remains pending until those bytes finish locally.
@@ -49,17 +57,21 @@ export const streamConverted = async (
                 if (log.enabled) clientFrames.push(frame);
                 // Recording and write submission are synchronous; a write failure poisons in finally.
                 if (parsed.type !== 'response.completed') session?.frame(frame);
-                await writeClientFrame(res, frame, transport?.limits.deliveryTimeoutMs);
+                transport?.clientFrame(['response.output_text.delta', 'response.refusal.delta',
+                    'response.function_call_arguments.delta', 'response.output_item.added'].includes(parsed.type));
+                await writer.write(frame);
             }
             if (terminal) break;
         }
-        if (!terminal) throw new Error('Upstream stream ended before its terminal event');
+        if (!terminal) throw new RelayFailure('upstream_stream_incomplete');
         session?.ensureCompleted();
         res.end();
     } catch (error) {
-        session?.abort();
+        writer.stop();
+        session?.abort(error);
         throw error;
     } finally {
+        writer.stop();
         session?.ensureCompleted();
         await log.write('3-upstream-response.sse', upstreamFrames.text());
         await log.write('4-client-response.sse', clientFrames.text());

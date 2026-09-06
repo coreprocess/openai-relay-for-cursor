@@ -1,6 +1,7 @@
 import type { ServerResponse } from 'node:http';
 import type { JsonBody } from '../http.ts';
 import { logLine } from '../log.ts';
+import { RelayFailure } from '../failure.ts';
 import type { ResponsesObject, ResponsesStreamEvent } from '../responsesTypes.ts';
 import { canonicalFingerprint } from './canonical.ts';
 import { OutputCapture } from './capture.ts';
@@ -35,7 +36,10 @@ export class ReplaySession {
         this.capture = new OutputCapture(config.maxEntryBytes);
         this.deadline = new ProgressDeadline({
             idleTimeoutMs: config.idleTimeoutMs, deliveryTimeoutMs: config.deliveryTimeoutMs,
-            onExpire: () => { this.abort(); this.response?.destroy(); },
+            onExpire: ({ phase }) => {
+                this.abort(new RelayFailure(phase === 'generation' ? 'cache_generation_timeout' : 'cache_delivery_timeout'));
+                this.response?.destroy();
+            },
         });
     }
 
@@ -113,9 +117,9 @@ export class ReplaySession {
         this.leaseReleased = true;
         this.released();
     }
-    abort(): void {
+    abort(reason: unknown = new RelayFailure('cache_session_aborted')): void {
         if (this.phase === 'resolved') return;
-        this.controller.abort();
+        this.controller.abort(reason);
         try { if (!this.observationAbandoned) this.store.poison(this.id); }
         catch { logLine('reasoning cache poison failed; durable recovery required'); }
         finally { this.dispose(); }
