@@ -210,14 +210,14 @@ const assertReplay = (received: Received, original: Received, replayed: boolean)
     assert.deepEqual(messages, replayed ? [original.output[1]] : []);
 };
 
-test('default admission overlaps eight generations and captures replayable JSON and SSE replies', { timeout: 30_000 }, async (t) => {
+test('default admission overlaps ten generations and captures replayable JSON and SSE replies', { timeout: 30_000 }, async (t) => {
     const app = await setup(t);
-    assert.equal(app.config.cache.maxConcurrent, 8);
+    assert.equal(app.config.cache.maxConcurrent, 10);
     const held = app.hold();
-    const pending = Array.from({ length: 8 }, (_, index) => app.request(history(`default-${index}`), index % 2 === 0));
-    await held.waitFor(8);
-    assert.equal(app.active, 8, 'all eight must reach upstream before any response is released');
-    assert.equal(app.peak, 8);
+    const pending = Array.from({ length: 10 }, (_, index) => app.request(history(`default-${index}`), index % 2 === 0));
+    await held.waitFor(10);
+    assert.equal(app.active, 10, 'all ten must reach upstream before any response is released');
+    assert.equal(app.peak, 10);
     const initial = [...app.received];
     for (const { body } of initial) {
         assert.equal(body.store, false);
@@ -233,7 +233,7 @@ test('default admission overlaps eight generations and captures replayable JSON 
         await app.request(continuation(original.prompt), original.body.stream !== true);
         assertReplay(app.received.at(-1)!, original, true);
     }
-    assert.equal(app.received.length, 16);
+    assert.equal(app.received.length, 20);
 });
 
 test('capacity two forwards all eight without cache injection on excess and preserves unrelated replay', { timeout: 30_000 }, async (t) => {

@@ -3,11 +3,11 @@ import test from 'node:test';
 import { CacheAdmission } from '../src/reasoning/admission.ts';
 import { loadCacheConfig } from '../src/reasoning/config.ts';
 
-test('default cache budget admits eight small concurrent generations, not just one', () => {
+test('default cache budget admits ten small concurrent generations with realistic replay', () => {
     const admission = new CacheAdmission(loadCacheConfig({}));
     const releases: Array<() => void> = [];
-    for (let i = 0; i < 8; i++) {
-        const release = admission.reserve(5000);
+    for (let i = 0; i < 10; i++) {
+        const release = admission.reserve(5000, 150 * 1024);
         assert.ok(release);
         releases.push(release);
     }
@@ -17,7 +17,7 @@ test('default cache budget admits eight small concurrent generations, not just o
     assert.equal(admission.retainedBytes, 0);
 });
 
-test('actual history size governs leases and large concurrent histories degrade caching only', () => {
+test('actual history and selected replay sizes govern leases', () => {
     const admission = new CacheAdmission(loadCacheConfig({}));
     const releases: Array<() => void> = [];
     for (let i = 0; i < 4; i++) {
@@ -27,7 +27,10 @@ test('actual history size governs leases and large concurrent histories degrade 
     }
     assert.equal(admission.reserve(6 * 1024 * 1024), null);
     releases.forEach((release) => release());
-    assert.ok(admission.reserve(6 * 1024 * 1024));
+    const release = admission.reserve(5000, 150 * 1024)!;
+    assert.ok(release);
+    assert.equal(admission.retainedBytes, 64 * 1024 + 2 * loadCacheConfig({}).maxEntryBytes + 2 * (5000 + 150 * 1024));
+    release();
 });
 
 test('enabled budgets must fit shared workspace before any request is prepared', () => {

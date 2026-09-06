@@ -244,9 +244,14 @@ reasoning and never automatically retries an upstream error.
   not unrelated histories. Identical visible histories and unobserved generations remain limitations.
 - Initial/generation inactivity defaults to 15 minutes and renews on received bytes. Delivery has a
   separate 30-second deadline. Neither is a total lifetime limit on a progressing generation.
-- The default 128 MiB cache budget supports up to eight small cached requests concurrently. Admission
-  uses measured history size, a bounded capture allowance, and one shared synchronous preparation
-  workspace—not 124 MiB per request. Larger requests can reduce the number cached simultaneously.
+- The default 128 MiB cache budget supports up to ten small cached requests concurrently. Admission
+  uses measured history and selected replay bytes, a bounded capture allowance, and one shared
+  preparation allowance. Larger requests can reduce the number cached simultaneously.
+- The replay limit is the actual total serialized output bytes in the compatible chain: **16 MiB by
+  default**, with no hidden 256 KiB ceiling or 32x parsing charge. Planning reads each distinct record
+  once per synchronous operation and retains exact ancestry checks; dispatch revalidates in a fresh
+  transaction. Valid compatible chains are replayed whole when within the configured limits. The
+  hot cache is accounted in serialized bytes, not a claim about exact JavaScript heap usage.
 - **Cache busy means cache bypass, not a failed model call.** Excess requests forward normally without
   replay/capture after a small durable start-position marker prevents stale reasoning reuse there.
   This sacrifices cache continuity at that position, not unrelated histories; later turns can rebuild it.
@@ -516,6 +521,24 @@ and whether downstream closed before local finish. Only allowlisted exception na
 are emitted; raw exception messages, URLs, prompt text and ciphertext are excluded. This lets an
 operator distinguish client disconnects, upstream failures, backpressure and local watchdog expiry
 without assuming that upstream HTTP 200 meant the stream completed.
+
+## Replay continuity validation
+
+Replay validation counts distinct serialized output blocks against the configured replay limit;
+there is no hidden 32x expansion ceiling. A read-only check of an existing immutable inspection
+snapshot validated all 217 retained chains (including 22 previously rejected only by the old
+budget) without changing the snapshot. Synthetic tests exercise a 40-record chain just below
+16 MiB, over-limit safe fallback, poisoned ancestry, row-version races, and one load per distinct
+record in each planning/dispatch operation.
+
+The isolated live validation ran ten concurrent generations and ten concurrent continuations after
+restart. All 20 calls succeeded and all ten continuations replayed their own exact encrypted output
+without cross-talk. No schema change, cache deletion, or production restart is needed to install
+this version; its behavior takes effect on the next planned service restart.
+
+`tests/validate-replay-snapshot.ts` accepts only an explicit read-only inspection copy. It is not
+part of `pnpm test` and never opens the live database. `tests/live-ten-replay.ts` is an explicit
+billable opt-in using the same key-file and authorization variables as the other live harnesses.
 
 ## Development
 

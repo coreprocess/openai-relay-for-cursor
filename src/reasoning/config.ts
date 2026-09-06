@@ -19,7 +19,7 @@ export const loadCacheConfig = (env: NodeJS.ProcessEnv = process.env): CacheConf
     maxEntryBytes: positiveInteger(env, 'REASONING_CACHE_ENTRY_MAX_BYTES', 4 * 1024 * 1024),
     maxReplayBytes: positiveInteger(env, 'REASONING_CACHE_REPLAY_MAX_BYTES', 16 * 1024 * 1024),
     maxPlanRecords: positiveInteger(env, 'REASONING_CACHE_PLAN_MAX_RECORDS', 256),
-    maxConcurrent: positiveInteger(env, 'REASONING_CACHE_MAX_CONCURRENT', 8),
+    maxConcurrent: positiveInteger(env, 'REASONING_CACHE_MAX_CONCURRENT', 10),
     idleTimeoutMs: positiveInteger(env, 'REASONING_CACHE_IDLE_TIMEOUT_MS', 15 * 60 * 1000),
     deliveryTimeoutMs: positiveInteger(env, 'REASONING_CACHE_DELIVERY_TIMEOUT_MS', 30_000),
     limits: {

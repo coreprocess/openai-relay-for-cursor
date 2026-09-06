@@ -10,6 +10,7 @@ import { DAY_MS, RetentionClock } from '../src/reasoning/retention.ts';
 import { StoreFiles } from '../src/reasoning/store-files.ts';
 import { RecordReader } from '../src/reasoning/store-records.ts';
 import { ReplayStore, markCoverageGapIfExists } from '../src/reasoning/store.ts';
+import type { ReplayPlanningStore } from '../src/reasoning/store.ts';
 import type { Observation, ReplayRecord, ScopeIdentity, StoreOptions } from '../src/reasoning/types.ts';
 
 const scope: ScopeIdentity = { digest: 'scope', credential: 'credential', model: 'alias', caller: 'caller' };
@@ -587,7 +588,7 @@ test('cumulative record and byte budgets fail closed without dispatch or partial
     assert.throws(() => limited.begin(scope, 'next', [a, b, c], 9e15), /budget/);
     limited.close();
     f.options.maxPlanRecords = 256;
-    f.options.maxReplayBytes = 100;
+    f.options.maxReplayBytes = a.bytes - 1;
     const bytesLimited = f.open();
     assert.equal(bytesLimited.get(scope.digest, 'end'), null);
     assert.throws(() => bytesLimited.begin(scope, 'next', [a], 9e15), /safe|budget/);
@@ -615,6 +616,9 @@ test('oversized or corrupt stored JSON is rejected before payload fetch and pars
         db.prepare("UPDATE payloads SET output_json = '[]', bytes = 2 WHERE end_digest = 'end'").run();
         db.prepare("UPDATE observations SET prior_plan = ? WHERE end_digest = 'end'")
             .run('x'.repeat(reader.maxPlanBytes + 1));
+        assert.equal(reader.validation().load(scope.digest, 'end'), null);
+        assert.equal(payloadFetches, 0);
+        db.prepare("UPDATE observations SET prior_plan = '[]', snapshot = ? WHERE end_digest = 'end'").run('x'.repeat(8193));
         assert.equal(reader.validation().load(scope.digest, 'end'), null);
         assert.equal(payloadFetches, 0);
     } finally { DatabaseSync.prototype.prepare = prepare; }
@@ -647,11 +651,23 @@ test('hot cache is wired, frozen, bounded, and checks persisted row versions', (
     assert.equal(reader.validation().load(scope.digest, 'end'), null);
 });
 
-test('store hot cache accounts parsed expansion and refuses over-budget cache entries', (t) => {
+test('store hot cache uses serialized sizes and refuses over-budget entries', (t) => {
     const f = fixture(t, { memoryBytes: 1 });
     const store = f.open();
     completed(store);
     assert.notEqual(store.get(scope.digest, 'end'), store.get(scope.digest, 'end'));
+    store.close();
+    const db = new DatabaseSync(f.options.path);
+    t.after(() => db.close());
+    const size = Number(db.prepare(`SELECT octet_length(p.output_json) + octet_length(o.prior_plan)
+        + octet_length(o.scope) + octet_length(o.end_digest) + octet_length(o.start_digest)
+        + octet_length(o.payload_fingerprint) + octet_length(o.output_hash) + octet_length(o.envelope_fingerprint)
+        + octet_length(o.producing_intent_id) + octet_length(o.snapshot) size
+        FROM observations o JOIN payloads p USING(scope, end_digest)`).get()!.size);
+    const exact = new RecordReader(db, { ...f.options, memoryBytes: size });
+    assert.equal(exact.validation().load(scope.digest, 'end'), exact.validation().load(scope.digest, 'end'));
+    const tooSmall = new RecordReader(db, { ...f.options, memoryBytes: size - 1 });
+    assert.notEqual(tooSmall.validation().load(scope.digest, 'end'), tooSmall.validation().load(scope.digest, 'end'));
 });
 
 test('descriptor array count is checked before JSON.parse allocates stored provenance', (t) => {
@@ -688,6 +704,86 @@ test('cumulative payload bytes are charged once per record and bounded across th
     assert.equal(limited.canReplay(b), false);
     assert.equal(limited.touchVerified(b), false);
     assert.throws(() => limited.begin(scope, 'next', [a, b], 9e15), /safe/);
+});
+
+test('repeated ancestry metadata does not consume the distinct serialized payload budget', (t) => {
+    const f = fixture(t, { diskBytes: 64 * 1024 * 1024 });
+    const store = f.open();
+    const chain: ReplayRecord[] = [];
+    for (let i = 0; i < 40; i++) {
+        chain.push(completed(store, `serialized-start-${i}`, `serialized-end-${i}`, [...chain], { output: output('x'.repeat(128)) }));
+    }
+    const payloadBytes = chain.reduce((sum, record) => sum + record.bytes, 0);
+    const ancestryBytes = chain.reduce((sum, record) => sum + Buffer.byteLength(JSON.stringify(record.priorPlan)), 0);
+    assert.ok(ancestryBytes > payloadBytes);
+    store.close();
+    f.options.maxReplayBytes = payloadBytes;
+    const exact = f.open();
+    assert.equal(exact.canReplay(chain.at(-1)!), true);
+    exact.resolve(exact.begin(scope, 'exact-budget', chain, 9e15));
+    exact.close();
+    f.options.maxReplayBytes = payloadBytes - 1;
+    const below = f.open();
+    assert.equal(below.canReplay(chain.at(-1)!), false);
+    assert.throws(() => below.begin(scope, 'below-budget', chain, 9e15), /safe/);
+});
+
+test('planning validation cannot escape its transaction or hide later poison and forged records', async (t) => {
+    const store = fixture(t).open();
+    const record = completed(store);
+    let escaped: ReplayPlanningStore | undefined;
+    store.withPlanning((planning) => {
+        escaped = planning;
+        assert.equal(planning.canReplay(record), true);
+        assert.equal(planning.canReplay({ ...record, output: output('forged') }), false);
+        assert.equal(planning.touchVerified({ ...record, priorPlan: [record] }), false);
+        assert.throws(() => store.bypass(scope, record.startDigest), /transaction already active/);
+        assert.equal(planning.canReplay(record), true);
+        return [];
+    });
+    await Promise.resolve();
+    assert.throws(() => escaped!.canReplay(record), /expired/);
+    assert.throws(() => escaped!.get(scope.digest, record.endDigest), /expired/);
+    store.bypass(scope, record.startDigest);
+    store.withPlanning((planning) => {
+        assert.equal(planning.canReplay(record), false);
+        assert.equal(planning.touchVerified(record), true);
+        return [];
+    });
+    assert.throws(() => store.begin(scope, 'fresh-dispatch', [record], 9e15), /no longer safe/);
+});
+
+test('cached valid roots never bypass exact ancestry-prefix consistency for another root', (t) => {
+    const f = fixture(t);
+    const store = f.open();
+    const a = completed(store, 'a-start', 'a-end');
+    const sibling = completed(store, 'sibling-start', 'sibling-end');
+    const b = completed(store, 'b-start', 'b-end', [a]);
+    const c = completed(store, 'c-start', 'c-end', [a, b]);
+    store.close();
+    const db = new DatabaseSync(f.options.path);
+    t.after(() => db.close());
+    db.prepare('UPDATE observations SET prior_plan = ? WHERE end_digest = ?').run(JSON.stringify([{
+        startDigest: sibling.startDigest, endDigest: sibling.endDigest, payloadFingerprint: sibling.payloadFingerprint,
+    }]), b.endDigest);
+    const validation = new RecordReader(db, f.options).validation();
+    const changed = validation.load(scope.digest, b.endDigest)!;
+    assert.equal(validation.validate(changed), true);
+    assert.equal(validation.validate(c, false), false);
+    assert.equal(validation.validate(c), false);
+    assert.equal(validation.validate(a), true);
+});
+
+test('a failed root does not suppress an independent valid planning fallback', (t) => {
+    const store = fixture(t).open();
+    const blocked = completed(store, 'blocked-start', 'blocked-end');
+    const safe = completed(store, 'safe-start', 'safe-end');
+    store.bypass(scope, blocked.startDigest);
+    store.withPlanning((planning) => {
+        assert.equal(planning.canReplay(blocked), false);
+        assert.equal(planning.canReplay(safe), true);
+        return [safe];
+    });
 });
 
 test('cleanup protects unresolved same-position competitors even without replay dependencies', (t) => {

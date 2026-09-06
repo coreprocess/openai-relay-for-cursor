@@ -32,13 +32,14 @@ export function publishObservation(
     const validation = reader.validation();
     // Even a conflicting repeated observation is a qualifying identity/ancestry touch.
     const oldRecord = validation.load(intent.scope, end);
-    if (oldRecord && validation.validate(oldRecord, false)) touchRecords(db, validation.records(), now);
+    const oldTouches = oldRecord && validation.validate(oldRecord, false) ? validation.records() : [];
     const old = db.prepare(`SELECT start_digest <> ? OR payload_fingerprint <> ? OR envelope_fingerprint <> ?
         OR prior_plan <> ? OR (output_hash IS NOT NULL AND ? IS NOT NULL AND output_hash <> ?) conflict
         FROM observations WHERE scope = ? AND end_digest = ?`)
         .get(intent.start_digest, observation.payloadFingerprint!, observation.envelopeFingerprint!, intent.prior_plan,
             hash, hash, intent.scope, end);
     if (old?.conflict) {
+        touchRecords(db, oldTouches, now);
         putMarker(db, intent.scope, 'end-conflict', end, now);
         db.prepare('UPDATE observations SET replayable = 0 WHERE scope = ? AND end_digest = ?').run(intent.scope, end);
         return;
@@ -54,6 +55,7 @@ export function publishObservation(
                 || entry.payloadFingerprint !== plan![i]!.payloadFingerprint)
             || !validation.validate(record)) { validPlan = false; break; }
     }
+    touchRecords(db, oldTouches, now);
     const marked = db.prepare(`SELECT 1 FROM markers WHERE scope = ? AND
         ((kind = 'start-poison' AND digest = ?) OR (kind = 'end-conflict' AND digest = ?)) LIMIT 1`)
         .get(intent.scope, intent.start_digest, end);

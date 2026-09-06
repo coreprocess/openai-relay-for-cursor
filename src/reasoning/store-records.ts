@@ -18,7 +18,6 @@ type Metadata = {
     observation_version: number; payload_version: number;
 };
 type CachedRecord = { version: string; record: ReplayRecord };
-const EXPANSION = 32;
 const keyFor = (scope: string, end: string): string => JSON.stringify([scope, end]);
 export const outputHash = (json: string): string => createHash('sha256').update(json).digest('hex');
 export const descriptor = (record: ReplayDescriptor): ReplayDescriptor => ({
@@ -90,7 +89,7 @@ export class RecordReader {
     clear(): void { this.hot.clear(); }
     validation(): RecordValidation { return new RecordValidation(this); }
 
-    read(scope: string, end: string, charge: (bytes: number, payloadBytes: number) => boolean): ReplayRecord | null {
+    read(scope: string, end: string, charge: (payloadBytes: number) => boolean): ReplayRecord | null {
         // SQLite returns only scalar lengths/versions before any possibly corrupt JSON crosses into JS.
         const metadata = this.db.prepare(`SELECT p.bytes, octet_length(p.output_json) output_bytes,
             octet_length(o.prior_plan) plan_bytes, o.row_version observation_version, p.row_version payload_version,
@@ -101,8 +100,9 @@ export class RecordReader {
             .get(scope, end) as Metadata | undefined;
         if (!metadata || metadata.output_bytes > this.maxEntryBytes || metadata.output_bytes !== metadata.bytes
             || metadata.plan_bytes > this.maxPlanBytes || metadata.metadata_bytes > 8192) return null;
-        const bytes = (metadata.output_bytes + metadata.plan_bytes + metadata.metadata_bytes) * EXPANSION + 1024;
-        if (!charge(bytes, metadata.output_bytes)) return null;
+        if (!charge(metadata.output_bytes)) return null;
+        // Cache accounting covers serialized JSON and metadata text, not parsed heap size or RSS.
+        const bytes = metadata.output_bytes + metadata.plan_bytes + metadata.metadata_bytes;
         const key = keyFor(scope, end);
         const version = `${metadata.observation_version}:${metadata.payload_version}`;
         const cached = this.hot.get(key);
@@ -142,15 +142,13 @@ export class RecordReader {
     }
 }
 
-/** One budget, one read/hash/parse per identity, shared by all roots within an operation. */
+/** One synchronous, mutation-free operation: distinct payload bytes and one read/hash/parse per identity. */
 export class RecordValidation {
     private readonly loaded = new Map<string, ReplayRecord | null>();
-    private readonly expanded = new Set<string>();
-    private readonly replayExpanded = new Set<string>();
+    private readonly structural = new Map<string, boolean>();
+    private readonly replayable = new Map<string, boolean>();
     private readonly verified = new Map<string, ReplayRecord>();
-    private bytes = 0;
     private payloadBytes = 0;
-    private invalid = false;
     private readonly reader: RecordReader;
     constructor(reader: RecordReader) { this.reader = reader; }
 
@@ -158,10 +156,8 @@ export class RecordValidation {
         const key = keyFor(scope, end);
         if (this.loaded.has(key)) return this.loaded.get(key)!;
         if (this.loaded.size >= this.reader.maxRecords) return null;
-        const record = this.reader.read(scope, end, (bytes, payloadBytes) => {
-            if (this.bytes + bytes > this.reader.maxBytes * EXPANSION
-                || this.payloadBytes + payloadBytes > this.reader.maxBytes) return false;
-            this.bytes += bytes;
+        const record = this.reader.read(scope, end, (payloadBytes) => {
+            if (this.payloadBytes + payloadBytes > this.reader.maxBytes) return false;
             this.payloadBytes += payloadBytes;
             return true;
         });
@@ -170,42 +166,36 @@ export class RecordValidation {
     }
 
     validate(record: ReplayRecord, replay = true): boolean {
-        if (this.invalid) return false;
-        const valid = this.walk(record, replay);
-        if (!valid) this.invalid = true;
+        const current = this.load(record.scope, record.endDigest);
+        // Check caller equality even when this identity has already passed validation.
+        if (!current || !sameRecord(record, current)) return false;
+        const key = keyFor(current.scope, current.endDigest);
+        const results = replay ? this.replayable : this.structural;
+        if (results.has(key)) return results.get(key)!;
+        const valid = this.walk(current, replay);
+        results.set(key, valid);
         return valid;
     }
 
-    private walk(record: ReplayRecord, replay: boolean): boolean {
-        const current = this.load(record.scope, record.endDigest);
-        if (!current || !sameRecord(record, current)) return false;
-        const expanded = replay ? this.replayExpanded : this.expanded;
+    private walk(current: ReplayRecord, replay: boolean): boolean {
         const lineage = [...current.priorPlan, descriptor(current)];
-        const positions = new Map(lineage.map((item, index) => [item.endDigest, index]));
-        if (positions.size !== lineage.length) return false;
-        const queue = [current];
-        const scheduled = new Set([keyFor(current.scope, current.endDigest)]);
-        while (queue.length) {
-            const candidate = queue.pop()!;
-            const key = keyFor(candidate.scope, candidate.endDigest);
-            if (expanded.has(key)) continue;
-            const position = positions.get(candidate.endDigest);
-            if (position === undefined || candidate.priorPlan.length !== position
+        if (new Set(lineage.map((item) => item.endDigest)).size !== lineage.length) return false;
+        const records: ReplayRecord[] = [];
+        for (const [position, expected] of lineage.entries()) {
+            const candidate = this.load(current.scope, expected.endDigest);
+            if (!candidate || !matches(candidate, expected) || candidate.generation !== current.generation
+                || candidate.priorPlan.length !== position
                 || candidate.priorPlan.some((prior, index) => !matches(prior, lineage[index]!))) return false;
-            if (replay && !this.safe(candidate)) return false;
-            expanded.add(key);
+            const key = keyFor(candidate.scope, candidate.endDigest);
+            if (replay && !(this.replayable.get(key) ?? this.safe(candidate))) return false;
+            records.push(candidate);
+        }
+        // Publish successes only after the whole prefix passed; failed roots must not taint fallback roots.
+        for (const candidate of records) {
+            const key = keyFor(candidate.scope, candidate.endDigest);
+            this.structural.set(key, true);
+            if (replay) this.replayable.set(key, true);
             this.verified.set(key, candidate);
-            for (const [index, prior] of candidate.priorPlan.entries()) {
-                if (prior.endDigest === candidate.endDigest) return false;
-                const ancestorKey = keyFor(candidate.scope, prior.endDigest);
-                // load() deduplicates before querying or parsing; scheduled deduplicates the work queue.
-                const ancestor = this.load(candidate.scope, prior.endDigest);
-                if (!ancestor || !matches(ancestor, prior) || ancestor.generation !== candidate.generation
-                    || ancestor.priorPlan.length !== index) return false;
-                if (scheduled.has(ancestorKey) || expanded.has(ancestorKey)) continue;
-                scheduled.add(ancestorKey);
-                queue.push(ancestor);
-            }
         }
         return true;
     }

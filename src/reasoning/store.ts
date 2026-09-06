@@ -13,6 +13,8 @@ import type { IntentRow } from './store-records.ts';
 import { initializeSchema, putMarker, recoverIntents } from './store-schema.ts';
 import type { Observation, ReplayRecord, ScopeIdentity, StoreOptions } from './types.ts';
 
+export type ReplayPlanningStore = Pick<ReplayStore, 'get' | 'canReplay' | 'touchVerified' | 'snapshotAccepted'>;
+
 export class ReplayStore {
     readonly secret: string;
     private readonly options: StoreOptions;
@@ -83,6 +85,7 @@ export class ReplayStore {
 
     private transaction<T>(operation: () => T): T {
         this.assertOpen();
+        if (this.db.isTransaction) throw new Error('Replay store transaction already active');
         for (let attempt = 0; ; attempt++) {
             try {
                 this.db.exec('BEGIN IMMEDIATE');
@@ -148,6 +151,36 @@ export class ReplayStore {
             if (!validation.validate(record, false)) return false;
             touchRecords(this.db, validation.records(), this.clock.now());
             return true;
+        });
+    }
+
+    /** Share reads only inside synchronous planning; apply touches after all validation is finished. */
+    withPlanning(operation: (store: ReplayPlanningStore) => ReplayRecord[]): ReplayRecord[] {
+        this.assertEnabled();
+        return this.transaction(() => {
+            const validation = this.reader.validation();
+            const touched = new Map<string, ReplayRecord>();
+            let active = true;
+            const check = () => { if (!active) throw new Error('Replay planning context has expired'); };
+            try {
+                const plan = operation({
+                    get: (scope, end) => { check(); return validation.load(scope, end); },
+                    canReplay: (record) => { check(); return validation.validate(record); },
+                    touchVerified: (record) => {
+                        check();
+                        if (!validation.validate(record, false)) return false;
+                        for (const inspected of validation.records()) {
+                            touched.set(JSON.stringify([inspected.scope, inspected.endDigest]), inspected);
+                        }
+                        return true;
+                    },
+                    snapshotAccepted: (scope, snapshot) => { check(); return this.snapshotAccepted(scope, snapshot); },
+                });
+                if (!Array.isArray(plan)) throw new Error('Replay planning must complete synchronously');
+                active = false;
+                touchRecords(this.db, [...touched.values()], this.clock.now());
+                return plan;
+            } finally { active = false; }
         });
     }
 

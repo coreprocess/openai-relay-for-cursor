@@ -1,6 +1,6 @@
 import { chatMessagesToInput } from '../chatMessages.ts';
 import type { JsonBody } from '../http.ts';
-import type { ReplayStore } from './store.ts';
+import type { ReplayPlanningStore, ReplayStore } from './store.ts';
 import type { PreparedIdentity, ReplayRecord } from './types.ts';
 
 const descriptorMatches = (a: ReplayRecord, b: ReplayRecord['priorPlan'][number]): boolean =>
@@ -10,6 +10,12 @@ export const selectReplayPlan = (
     store: ReplayStore, identity: PreparedIdentity, maxRecords: number, maxBytes: number,
 ): ReplayRecord[] => {
     if (!identity.eligible) return [];
+    return store.withPlanning((planning) => selectVerifiedPlan(planning, identity, maxRecords, maxBytes));
+};
+
+const selectVerifiedPlan = (
+    store: ReplayPlanningStore, identity: PreparedIdentity, maxRecords: number, maxBytes: number,
+): ReplayRecord[] => {
     const boundaries = new Map(identity.prefixes.map((digest, index) => [digest, index]));
     // Candidate payloads are loaded one at a time, never all history hits at once.
     let work = Math.max(1, maxRecords * 4);

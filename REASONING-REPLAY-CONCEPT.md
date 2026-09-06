@@ -138,7 +138,7 @@ The schema separates:
 
 Other non-admission state uses the observation's `replayable` field. Digests and plan descriptors are hex strings stored in JSON, not packed binary records. Producing intent IDs remain as non-FK values after intents are deleted.
 
-Stored lengths and estimated parsed-memory costs are checked before loading JSON. Ancestry validation deduplicates records before loading. The bounded hot cache holds immutable objects and checks persisted row versions; eviction changes no durable knowledge.
+Stored lengths, descriptor counts, and distinct serialized payload bytes are checked before loading JSON. Ancestry validation deduplicates records before loading and shares results only inside one synchronous operation. The bounded hot cache holds immutable objects and checks persisted row versions; eviction changes no durable knowledge.
 
 The snapshot heuristic accepts the latest observed snapshot or one observed within the last 24 hours. Earlier blocks inherit the acceptance represented by the newest record determining the plan. This reduces incompatible replay attempts but cannot guarantee provider acceptance of old ciphertext.
 
@@ -200,20 +200,19 @@ Defaults from `src/reasoning/config.ts`:
 
 - Cache disabled; database `data/reasoning-cache.sqlite`; idle retention 30 days.
 - Overall cache-accounting budget **128 MiB**; disk admission 1 GiB; reserve 64 MiB, with a 64 KiB minimum.
-- Entry/capture allowance 4 MiB; configured replay ceiling 16 MiB; plan limit 256 records; full-cache concurrency 8.
+- Entry/capture allowance 4 MiB; serialized replay ceiling 16 MiB; plan limit 256 records; full-cache concurrency 10.
 - Combined canonical scope/history budget 32 MiB; 6,400 messages; 2,000,000 nodes; depth 64; 4,000 candidate lookups; 16 MiB scratch.
 - Generation inactivity 900,000 ms; fixed delivery 30,000 ms.
 
-The 128 MiB setting is not the hot-cache size. With memory budget `M`, configured replay bytes `R`, entry allowance `E`, scratch `S` and measured canonical bytes `C`:
+The 128 MiB setting is not the hot-cache size. With memory budget `M`, configured replay bytes `R`, entry allowance `E`, scratch `S`, measured canonical history bytes `C` and selected original output bytes `P`:
 
 - Hot cache `H = min(4 MiB, floor(M / 32))`.
-- Replay workspace `W = min(R, floor(M / 16))`.
-- Shared reservation `H + S + 2W`.
-- Session allowance `64 KiB + 2E + 2C + W / 8`.
+- Shared preparation allowance `H + S + R`.
+- Session allowance `64 KiB + 2E + 2(C + P)`.
 
-At defaults, shared accounting is **36 MiB**, leaving 92 MiB for sessions. Small requests can fit eight cached sessions. An enabled configuration unable to fit shared work plus 64 KiB fails startup.
+At defaults, shared accounting is **36 MiB**, leaving 92 MiB for sessions. Ten small requests with representative 150 KiB replay chains fit. Actual history and selected replay sizes can reduce concurrency for larger workloads. An enabled configuration unable to fit shared work plus 64 KiB fails startup. These are simple byte allowances, not a measured whole-process memory guarantee.
 
-**Effective store-validation ceiling:** runtime supplies `floor(W / 32)` serialized payload bytes to account for conservative 32× parsing expansion. This is **256 KiB by default**, with metadata/plan charges able to constrain it further. The 16 MiB configured replay ceiling is therefore not the effective default readable-plan size. Increasing only that setting may not increase the allowance because memory also bounds `W`.
+**Replay validation uses the configured 16 MiB serialized payload limit directly.** Each distinct original output block counts once. Per-record JSON/metadata size and descriptor-count checks remain, but repeated ancestry metadata is not multiplied into an artificial aggregate heap charge. The hot cache is bounded by serialized content size. A synchronous planning context shares record loads and validation results; dispatch still performs a separate fresh transaction-time validation before sending the request.
 
 Planner search is sequential and bounded by `maxPlanRecords * 4` verification work. Cache-state-dependent budget exhaustion falls back to no replay while retaining observation; it is not an intent-less deterministic skip.
 

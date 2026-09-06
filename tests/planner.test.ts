@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { reconstructInput, selectReplayPlan } from '../src/reasoning/planner.ts';
 import type { PreparedIdentity, ReplayRecord } from '../src/reasoning/types.ts';
-import type { ReplayStore } from '../src/reasoning/store.ts';
+import type { ReplayPlanningStore, ReplayStore } from '../src/reasoning/store.ts';
 
 const record = (start: string, end: string, prior: ReplayRecord[] = []): ReplayRecord => ({
     scope: 'scope', generation: 1, startDigest: start, endDigest: end, payloadFingerprint: end,
@@ -16,10 +16,12 @@ const identity: PreparedIdentity = {
     prefixes: ['0', '1', '2', '3'], envelopes: ['1', '2', '3'], canonicalBytes: 100, append: () => { throw new Error('unused'); },
 };
 const fakeStore = (records: ReplayRecord[], blocked = '') => ({
-    get: (_scope: string, end: string) => records.find((r) => r.endDigest === end) ?? null,
-    canReplay: (r: ReplayRecord) => r.endDigest !== blocked,
-    touchVerified: () => true,
-    snapshotAccepted: () => true,
+    withPlanning: (operation: (store: ReplayPlanningStore) => ReplayRecord[]) => operation({
+        get: (_scope: string, end: string) => records.find((r) => r.endDigest === end) ?? null,
+        canReplay: (r: ReplayRecord) => r.endDigest !== blocked,
+        touchVerified: () => true,
+        snapshotAccepted: () => true,
+    }),
 }) as unknown as ReplayStore;
 
 test('newest record dictates ancestry, including empty plan after bypass', () => {

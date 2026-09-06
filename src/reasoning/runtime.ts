@@ -30,9 +30,8 @@ export class ReplayRuntime {
         this.store = c.enabled || existsSync(c.dbPath) ? new ReplayStore({
             path: c.dbPath, idleDays: c.idleDays, diskBytes: c.diskBytes, reserveBytes: c.reserveBytes,
             memoryBytes: this.admission.hotBytes, maxEntryBytes: c.maxEntryBytes,
-            // Store validation charges a conservative 32x JSON expansion. Its transient copy
-            // must fit inside the reserved replay budget, not multiply that budget by 32.
-            maxReplayBytes: Math.max(1, Math.floor(this.admission.replayScratchBytes / 32)), maxPlanRecords: c.maxPlanRecords,
+            // The configured replay limit is the serialized payload limit, without a hidden reduction.
+            maxReplayBytes: c.maxReplayBytes, maxPlanRecords: c.maxPlanRecords,
         }, { directory: resolve(config.adminSnapshotDir ?? join(homedir(), '.openai-relay-inspection')) }) : null;
         if (!c.enabled && this.store) {
             // Hold exclusive ownership while disabled traffic is unobserved. Otherwise an
@@ -101,10 +100,23 @@ export class ReplayRuntime {
             logLine(`reasoning cache bypass reason=${this.admission.refusalReason(identity.canonicalBytes)} active=${this.admission.activeSessions} leasedBytes=${this.admission.retainedBytes}; forwarding without replay`);
             return { payload: null, session: null };
         }
+        let releaseLease: () => void = release;
         let id: string | undefined;
         try {
             this.store.ensureScope(identity.scope);
             let plan = selectReplayPlan(this.store, identity, c.maxPlanRecords, c.maxReplayBytes);
+            const replayBytes = plan.reduce((sum, record) => sum + record.bytes, 0);
+            // Reprice the lease using selected payload bytes before reconstruction/serialization.
+            // This synchronous replacement cannot race another request's admission.
+            release();
+            const pricedRelease = this.admission.reserve(identity.canonicalBytes, replayBytes);
+            if (!pricedRelease) {
+                this.store.bypass(identity.scope, start);
+                this.metrics.memoryBypasses++;
+                logLine(`reasoning cache bypass reason=memory replayBytes=${replayBytes}; forwarding without replay`);
+                return { payload: null, session: null };
+            }
+            releaseLease = pricedRelease;
             const input = plan.length ? reconstructInput(identity, plan) : null;
             if (!input) plan = [];
             const body = identity.eligible ? {
@@ -116,17 +128,17 @@ export class ReplayRuntime {
             id = this.store.begin(identity.scope, start, plan, Date.now() + c.idleTimeoutMs);
             const session = new ReplaySession(this.store, id, identity, c, () => {
                 this.sessions.delete(session);
-                release();
+                releaseLease();
             });
             this.sessions.add(session);
             if (identity.eligible) this.metrics.cachedDispatches++; else this.metrics.observeOnlyDispatches++;
             if (plan.length) this.metrics.replayingDispatches++;
             this.metrics.replayedBlocksDispatched += plan.length;
-            logLine(`reasoning cache dispatch replacements=${plan.length} eligible=${identity.eligible} active=${this.admission.activeSessions} leasedBytes=${this.admission.retainedBytes}`);
+            logLine(`reasoning cache dispatch replacements=${plan.length} replayBytes=${plan.reduce((sum, record) => sum + record.bytes, 0)} eligible=${identity.eligible} active=${this.admission.activeSessions} leasedBytes=${this.admission.retainedBytes}`);
             return { payload, session };
         } catch (error) {
             this.metrics.preparationFailures++;
-            release();
+            releaseLease();
             try { if (id) this.store.poison(id); }
             catch (poisonError) { throw new CacheUnavailableError(poisonError); }
             logLine('reasoning cache safety failure operation=prepare');
